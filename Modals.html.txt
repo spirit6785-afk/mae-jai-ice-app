@@ -1,0 +1,1568 @@
+<script>
+  /**
+   * ============================================================================
+   * 🪟 MAE JAI SMART ERP - MASTER MODALS CONTROLLER (Modals.html)
+   * Version: 4.8 (Complete 11 Operational Modals + Auto-Print A4 Shift Report)
+   * ⚠️ หมายเหตุ: วางโค้ดไฟล์นี้ใน "Modals.html" เท่านั้น
+   * ============================================================================
+   */
+
+  // ==========================================
+  // 🛠️ HELPER: เปิดหน้าต่าง Modal กลาง
+  // ==========================================
+  function openModal(htmlContent) {
+    const backdrop = document.getElementById('modal-backdrop');
+    const content = document.getElementById('modal-content');
+    if (!backdrop || !content) return;
+    content.innerHTML = htmlContent;
+    backdrop.classList.remove('hidden');
+    if (typeof lucide !== 'undefined') lucide.createIcons();
+  }
+
+  // ==========================================
+  // 👥 1. CUSTOMER MODAL (เพิ่ม/แก้ไขลูกค้า + ราคาพิเศษ + โปรคละ 3 ชิ้น 100)
+  // ==========================================
+  async function openCustomerModalById(customerId) {
+    if (!STATE.customerDashboard.routes || STATE.customerDashboard.routes.length === 0) {
+      try {
+        const d = await apiCall('getCustomerDashboard');
+        STATE.customerDashboard.list = d.customers || [];
+        STATE.customerDashboard.routes = d.routes || [];
+        STATE.customerDashboard.products = d.products || [];
+      } catch (e) {}
+    }
+
+    const cust = customerId
+      ? (STATE.customerDashboard.list.find(c => c.CustomerID === customerId) || STATE.pos.customers.find(c => c.CustomerID === customerId))
+      : null;
+
+    const routes = STATE.customerDashboard.routes.length ? STATE.customerDashboard.routes : (STATE.pos.routes || []);
+    const products = STATE.customerDashboard.products.length ? STATE.customerDashboard.products : (STATE.pos.products || []);
+
+    const rOpts = routes.map(r => `<option value="${r.RouteID}" ${cust && cust.RouteID === r.RouteID ? 'selected' : ''}>${r.RouteName}</option>`).join('');
+
+    const spMap = {};
+    if (cust && Array.isArray(cust.SpecialPrices)) {
+      cust.SpecialPrices.forEach(sp => { spMap[sp.ProductID] = sp.Price; });
+    } else if (cust && STATE.pos.specialPrices) {
+      STATE.pos.specialPrices.filter(s => s.CustomerID === cust.CustomerID).forEach(s => { spMap[s.ProductID] = s.SpecialPrice; });
+    }
+
+    const hasPromo = cust ? !!cust.HasPromo3For100 : false;
+    const eligStr = (cust && cust.PromoEligibleProducts) ? String(cust.PromoEligibleProducts) : 'ALL';
+    const eligSet = new Set(eligStr.split(','));
+
+    const spInputs = products.map(p => {
+      const val = spMap[p.ProductID] !== undefined ? spMap[p.ProductID] : '';
+      const isElig = (eligStr === 'ALL' || eligSet.has(p.ProductID));
+      return `
+        <div class="flex items-center justify-between p-2.5 bg-slate-50 rounded-xl border border-slate-200 gap-2">
+          <div class="flex-1 min-w-0">
+            <p class="font-bold text-xs text-slate-800 truncate">${p.ProductName}</p>
+            <p class="text-[10px] text-slate-400">ราคาปกติหน้าลาน: ฿${p.DefaultPrice} / ${p.Unit}</p>
+          </div>
+          <label class="flex items-center gap-1 text-[10px] font-bold text-purple-700 bg-purple-50 px-2 py-1 rounded border border-purple-200 cursor-pointer">
+            <input type="checkbox" class="cust-prm-chk accent-purple-600" value="${p.ProductID}" ${isElig ? 'checked' : ''}> ร่วมโปร 3/100
+          </label>
+          <div class="w-24">
+            <input type="number" class="cust-sp-input w-full p-1.5 bg-white border border-amber-300 rounded-lg text-right font-bold text-amber-700 text-xs outline-none focus:border-amber-500" data-pid="${p.ProductID}" value="${val}" placeholder="ปกติ (${p.DefaultPrice})">
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-4">
+        <h3 class="font-extrabold text-lg text-slate-800 flex items-center gap-2">
+          <i data-lucide="user-Check" class="w-5 h-5 text-blue-600"></i> ${cust ? 'แก้ไขข้อมูลลูกค้า: ' + cust.CustomerName : 'เพิ่มลูกค้าใหม่'}
+        </h3>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <input type="hidden" id="m-cust-id" value="${cust ? cust.CustomerID : ''}">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">ชื่อร้านค้า / ชื่อลูกค้า *</label>
+            <input type="text" id="m-cust-name" value="${cust ? escStr(cust.CustomerName) : ''}" class="w-full mt-1 p-2.5 border-2 border-slate-200 rounded-xl font-bold outline-none focus:border-blue-500" placeholder="เช่น เจ๊พรส้มตำ">
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">เบอร์โทรศัพท์</label>
+            <input type="text" id="m-cust-phone" value="${cust ? escStr(cust.Phone || '') : ''}" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-medium outline-none focus:border-blue-500" placeholder="08x-xxx-xxxx">
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">สายส่งประจำ</label>
+            <select id="m-cust-route" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold text-slate-700 bg-slate-50">
+              <option value="หน้าลาน" ${cust && cust.RouteID === 'หน้าลาน' ? 'selected' : ''}>🏠 ซื้อหน้าลาน (หน้าร้าน)</option>
+              ${rOpts}
+            </select>
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">ประเภทลูกค้า</label>
+            <select id="m-cust-type" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-semibold text-slate-700">
+              <option value="ร้านประจำ" ${cust && cust.CustomerType === 'ร้านประจำ' ? 'selected' : ''}>ร้านประจำ</option>
+              <option value="เอเย่นต์" ${cust && cust.CustomerType === 'เอเย่นต์' ? 'selected' : ''}>เอเย่นต์</option>
+              <option value="ขาจร" ${cust && cust.CustomerType === 'ขาจร' ? 'selected' : ''}>ขาจร</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">วงเงินเครดิต (฿)</label>
+            <input type="number" id="m-cust-limit" value="${cust ? (cust.CreditLimit || 0) : 5000}" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold text-right text-amber-700">
+          </div>
+        </div>
+
+        <div class="p-3 bg-purple-50 border-2 border-purple-200 rounded-xl flex items-center justify-between">
+          <div>
+            <p class="font-extrabold text-xs text-purple-900">🎁 เปิดสิทธิ์โปรโมชั่น "คละ 3 กระสอบ 100 บาท"</p>
+            <p class="text-[10px] text-purple-700">เมื่อเปิดสิทธิ์ แอปคนขับรถจะคำนวณส่วนลดโปร 3 ชิ้น 100 ให้อัตโนมัติ</p>
+          </div>
+          <input type="checkbox" id="m-cust-promo3For100" class="w-6 h-6 accent-purple-600 rounded cursor-pointer" ${hasPromo ? 'checked' : ''}>
+        </div>
+
+        <div class="space-y-2 pt-1">
+          <label class="text-xs font-extrabold text-slate-700 block">🏷️ กำหนดราคาพิเศษเฉพาะร้านนี้ (เว้นว่าง = ใช้ราคาปกติ)</label>
+          <div class="space-y-1.5 max-h-[210px] overflow-y-auto pr-1">${spInputs}</div>
+        </div>
+
+        ${cust ? `
+          <div class="flex items-center justify-between pt-2 border-t border-slate-100">
+            <span class="text-xs font-bold text-slate-500">สถานะการใช้งาน:</span>
+            <select id="m-cust-status" class="p-1.5 border border-slate-200 rounded-lg text-xs font-bold">
+              <option value="Active" ${cust.Status !== 'Inactive' ? 'selected' : ''}>🟢 ใช้งานปกติ (Active)</option>
+              <option value="Inactive" ${cust.Status === 'Inactive' ? 'selected' : ''}>🔴 ระงับการใช้งาน (Inactive)</option>
+            </select>
+          </div>
+        ` : ''}
+
+        <div class="flex justify-end gap-2 pt-3 border-t border-slate-100">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="saveCustomerModal()" class="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-extrabold shadow-md text-xs flex items-center gap-1.5">
+            <i data-lucide="save" class="w-4 h-4"></i> บันทึกข้อมูลลูกค้า
+          </button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  }
+
+  async function saveCustomerModal() {
+    const name = document.getElementById('m-cust-name').value.trim();
+    if (!name) return showToast('กรุณาระบุชื่อร้านค้า/ลูกค้า', 'error');
+
+    const spList = [];
+    document.querySelectorAll('.cust-sp-input').forEach(inp => {
+      spList.push({ ProductID: inp.getAttribute('data-pid'), Price: inp.value.trim() });
+    });
+
+    const checkedPrm = [];
+    document.querySelectorAll('.cust-prm-chk:checked').forEach(chk => checkedPrm.push(chk.value));
+
+    const payload = {
+      CustomerID: document.getElementById('m-cust-id').value,
+      CustomerName: name,
+      Phone: document.getElementById('m-cust-phone').value.trim(),
+      RouteID: document.getElementById('m-cust-route').value,
+      CustomerType: document.getElementById('m-cust-type').value,
+      CreditLimit: document.getElementById('m-cust-limit').value,
+      Status: document.getElementById('m-cust-status') ? document.getElementById('m-cust-status').value : 'Active',
+      HasPromo3For100: document.getElementById('m-cust-promo3For100').checked,
+      PromoEligibleProducts: checkedPrm.length > 0 ? checkedPrm.join(',') : 'ALL',
+      SpecialPrices: spList
+    };
+
+    try {
+      await apiCall('saveCustomer', payload);
+      closeModal();
+      showToast('บันทึกข้อมูลลูกค้าสำเร็จ!');
+      if (document.getElementById('nav-customers')?.classList.contains('active-nav')) renderCustomers();
+      else if (document.getElementById('nav-pos')?.classList.contains('active-nav')) renderPOS();
+    } catch (e) {}
+  }
+
+  // ==========================================
+  // 🚚 2. CREATE DISPATCH MODAL (ปล่อยรถกะเช้า & ตัดสต๊อกขึ้นรถ)
+  // ==========================================
+  function openCreateDispatchModal() {
+    const d = STATE.route || {};
+    const rOpts = (d.routes || []).map(r => `<option value="${r.RouteID}" data-name="${escStr(r.RouteName)}">${r.RouteName}</option>`).join('');
+    const vOpts = (d.vehicles || []).map(v => `<option value="${escStr(v.LicensePlate)}">${v.LicensePlate} (${v.VehicleType || 'รถส่งน้ำแข็ง'})</option>`).join('');
+    const eOpts = (d.employees || []).map(e => `<option value="${escStr(e.EmpName)}">${e.EmpName}</option>`).join('');
+
+    const prodRows = (d.products || []).map(p => `
+      <div class="flex items-center justify-between p-2.5 bg-slate-50 rounded-xl border border-slate-200">
+        <div>
+          <p class="font-bold text-xs text-slate-800">${p.ProductName}</p>
+          <p class="text-[10px] text-slate-400">หน่วย: ${p.Unit}</p>
+        </div>
+        <input type="number" class="dsp-load-qty w-24 p-2 bg-white border-2 border-indigo-200 rounded-xl text-center font-black text-indigo-700 text-sm outline-none focus:border-indigo-500" data-id="${p.ProductID}" data-name="${escStr(p.ProductName)}" placeholder="0" min="0" oninput="recalcDispatchLoadTotal()">
+      </div>
+    `).join('');
+
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-4">
+        <h3 class="font-extrabold text-lg text-slate-800 flex items-center gap-2">
+          <i data-lucide="play-circle" class="w-5 h-5 text-indigo-600"></i> ปล่อยรถสายส่งกะเช้า (เบิกน้ำแข็งขึ้นรถ)
+        </h3>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">เลือกสายส่ง *</label>
+            <select id="dsp-route" class="w-full mt-1 p-2.5 border-2 border-indigo-200 rounded-xl font-bold text-indigo-950 bg-indigo-50/30">${rOpts}</select>
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">คนขับรถ *</label>
+            <select id="dsp-driver" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold text-slate-800">${eOpts}</select>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">ทะเบียนรถขนส่ง</label>
+            <select id="dsp-vehicle" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold text-slate-700">${vOpts}</select>
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">เลขไมล์ก่อนออกส่ง (กม.)</label>
+            <input type="number" id="dsp-start-mile" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold text-center" placeholder="เช่น 125400">
+          </div>
+        </div>
+
+        <div class="space-y-2 pt-1">
+          <div class="flex justify-between items-center">
+            <label class="text-xs font-extrabold text-slate-700">🧊 ระบุจำนวนน้ำแข็งที่เบิกขึ้นรถ (ตัดสต๊อกห้องเย็นอัตโนมัติ)</label>
+            <span id="dsp-total-badge" class="text-xs font-black text-indigo-700 bg-indigo-100 px-2.5 py-0.5 rounded-lg">รวม 0 หน่วย</span>
+          </div>
+          <div class="space-y-1.5 max-h-[220px] overflow-y-auto pr-1">${prodRows}</div>
+        </div>
+
+        <div>
+          <label class="text-xs font-bold text-slate-600">หมายเหตุ</label>
+          <input type="text" id="dsp-note" class="w-full mt-1 p-2 border border-slate-200 rounded-xl text-xs" placeholder="หมายเหตุเพิ่มเติม (ถ้ามี)...">
+        </div>
+
+        <div class="flex justify-end gap-2 pt-3 border-t border-slate-100">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="saveCreateDispatch()" class="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-extrabold shadow-md text-xs flex items-center gap-1.5">
+            <i data-lucide="truck" class="w-4 h-4"></i> ยืนยันปล่อยรถ & ตัดสต๊อก
+          </button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  }
+
+  function recalcDispatchLoadTotal() {
+    let sum = 0;
+    document.querySelectorAll('.dsp-load-qty').forEach(inp => { sum += parseFloat(inp.value) || 0; });
+    const badge = document.getElementById('dsp-total-badge');
+    if (badge) badge.innerText = `รวม ${sum.toLocaleString()} หน่วย`;
+  }
+
+  async function saveCreateDispatch() {
+    const rSel = document.getElementById('dsp-route');
+    if (!rSel || !rSel.value) return showToast('กรุณาเลือกสายส่ง', 'error');
+    const rName = rSel.options[rSel.selectedIndex].getAttribute('data-name') || rSel.value;
+
+    let totalQty = 0;
+    const detailsArr = [];
+    const detailsText = [];
+    document.querySelectorAll('.dsp-load-qty').forEach(inp => {
+      const q = parseFloat(inp.value) || 0;
+      if (q > 0) {
+        totalQty += q;
+        detailsArr.push({ id: inp.getAttribute('data-id'), name: inp.getAttribute('data-name'), qty: q });
+        detailsText.push(`${inp.getAttribute('data-name')} x${q}`);
+      }
+    });
+
+    if (totalQty <= 0) return showToast('กรุณาระบุจำนวนน้ำแข็งขึ้นรถอย่างน้อย 1 รายการ', 'error');
+
+    const payload = {
+      RouteID: rSel.value,
+      RouteName: rName,
+      DriverName: document.getElementById('dsp-driver').value,
+      VehicleID: document.getElementById('dsp-vehicle').value,
+      StartMileage: document.getElementById('dsp-start-mile').value,
+      LoadedQty: totalQty,
+      LoadDetailsJSON: JSON.stringify(detailsArr),
+      LoadDetailsText: detailsText.join(', '),
+      Note: document.getElementById('dsp-note').value.trim()
+    };
+
+    try {
+      await apiCall('createDispatch', payload);
+      closeModal();
+      showToast('เปิดกะปล่อยรถและตัดสต๊อกขึ้นรถสำเร็จ!');
+      renderSettlement();
+    } catch (e) {}
+  }
+
+  // ==========================================
+  // ➕ 3. RELOAD DISPATCH MODAL (เบิกน้ำแข็งเพิ่มระหว่างวัน)
+  // ==========================================
+  function openReloadDispatchModalById(dispatchId) {
+    const dsp = (STATE.route.dispatches || []).find(x => x.DispatchID === dispatchId);
+    if (!dsp) return;
+
+    const prodRows = (STATE.route.products || []).map(p => `
+      <div class="flex items-center justify-between p-2.5 bg-emerald-50/50 rounded-xl border border-emerald-200">
+        <span class="font-bold text-xs text-slate-800">${p.ProductName} (${p.Unit})</span>
+        <input type="number" class="rld-qty-input w-24 p-2 bg-white border-2 border-emerald-400 rounded-xl text-center font-black text-emerald-700 text-sm outline-none" data-id="${p.ProductID}" data-name="${escStr(p.ProductName)}" placeholder="0" min="0">
+      </div>
+    `).join('');
+
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-4">
+        <div>
+          <span class="text-[10px] font-bold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded-full">${dsp.DispatchID}</span>
+          <h3 class="font-extrabold text-lg text-slate-800 mt-0.5">เบิกน้ำแข็งเพิ่ม: ${dsp.RouteName}</h3>
+        </div>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <input type="hidden" id="rld-dsp-id" value="${dsp.DispatchID}">
+        <p class="text-xs text-slate-600 bg-slate-100 p-2.5 rounded-xl">คนขับ: <b>${dsp.DriverName}</b> | ยอดเบิกสะสมเดิม: <b class="text-indigo-700">${dsp.LoadedQty} หน่วย</b></p>
+        <div class="space-y-1.5 max-h-[240px] overflow-y-auto pr-1">${prodRows}</div>
+        <input type="text" id="rld-note" class="w-full p-2.5 border border-slate-200 rounded-xl text-xs" placeholder="หมายเหตุ (เช่น เบิกเพิ่มรอบบ่าย)...">
+        <div class="flex justify-end gap-2 pt-2">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="saveReloadDispatch()" class="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-extrabold shadow-md text-xs">➕ ยืนยันเบิกเพิ่ม & ตัดสต๊อก</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  }
+
+  async function saveReloadDispatch() {
+    let addedQty = 0;
+    const detailsArr = [];
+    const detailsText = [];
+    document.querySelectorAll('.rld-qty-input').forEach(inp => {
+      const q = parseFloat(inp.value) || 0;
+      if (q > 0) {
+        addedQty += q;
+        detailsArr.push({ id: inp.getAttribute('data-id'), name: inp.getAttribute('data-name'), qty: q });
+        detailsText.push(`${inp.getAttribute('data-name')} +${q}`);
+      }
+    });
+
+    if (addedQty <= 0) return showToast('กรุณาระบุจำนวนน้ำแข็งที่เบิกเพิ่ม', 'error');
+
+    try {
+      await apiCall('reloadDispatch', {
+        DispatchID: document.getElementById('rld-dsp-id').value,
+        AddedQty: addedQty,
+        AddedDetailsJSON: JSON.stringify(detailsArr),
+        AddedDetailsText: detailsText.join(', '),
+        Note: document.getElementById('rld-note').value.trim(),
+        CreatedBy: 'Admin'
+      });
+      closeModal();
+      showToast(`เบิกน้ำแข็งเพิ่ม +${addedQty} หน่วย สำเร็จ!`);
+      renderSettlement();
+    } catch (e) {}
+  }
+
+  // ==========================================
+  // 🏁 4. CLOSE DISPATCH MODAL (V4.8 Audit-Grade Settlement & Auto-Print A4 Report)
+  // ==========================================
+  function openCloseDispatchModalById(dispatchId) {
+    const dsp = (STATE.route.dispatches || []).find(x => x.DispatchID === dispatchId);
+    if (!dsp) return;
+
+    const loadedQty = parseFloat(dsp.LoadedQty) || 0;
+    const soldQty = dsp.LiveSoldQty !== undefined ? dsp.LiveSoldQty : (parseFloat(dsp.SoldQty) || 0);
+    const cashOnlySales = dsp.LiveCashOnlySales !== undefined ? dsp.LiveCashOnlySales : (parseFloat(dsp.CashSales) || 0);
+    const debtCash = dsp.LiveDebtCash || 0;
+    const debtTransfer = dsp.LiveDebtTransfer || 0;
+    const totalCashIn = cashOnlySales + debtCash;
+
+    const trfSales = dsp.LiveTransferSales !== undefined ? dsp.LiveTransferSales : (parseFloat(dsp.TransferSales) || 0);
+    const crdSales = dsp.LiveCreditSales !== undefined ? dsp.LiveCreditSales : (parseFloat(dsp.CreditSales) || 0);
+    const fuelCash = dsp.LiveFuelCash !== undefined ? dsp.LiveFuelCash : (parseFloat(dsp.LiveFuelExpense) || parseFloat(dsp.FuelExpense) || 0);
+    const startMile = parseFloat(dsp.StartMileage) || 0;
+    const endMile = parseFloat(dsp.EndMileage) || 0;
+
+    const items = dsp.ItemBreakdown || [];
+    const returnItemsHTML = items.length > 0 ? items.map(itm => `
+      <div class="flex items-center justify-between py-1.5 px-3 bg-white rounded-xl border border-slate-200 text-xs">
+        <div>
+          <span class="font-bold text-slate-800">${itm.name}</span>
+          <span class="text-[10px] text-slate-500 block">เบิกสุทธิ ${itm.loadedQty} | ขายไป ${itm.soldQty} | ควรเหลือบนรถ <b class="text-blue-600">${itm.expectedRemain}</b></span>
+        </div>
+        <div class="flex items-center gap-1.5">
+          <span class="text-[10px] font-bold text-slate-500">คืนคลัง:</span>
+          <input type="number" class="cls-ret-item w-16 p-1.5 border-2 border-blue-300 rounded-lg text-center font-black text-blue-700 text-sm" data-id="${itm.id}" data-name="${escStr(itm.name)}" value="0" min="0" oninput="syncReturnItemsTotal()">
+        </div>
+      </div>
+    `).join('') : '';
+
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-3">
+        <div>
+          <span class="text-[10px] font-extrabold bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full">${dsp.DispatchID}</span>
+          <h3 class="font-extrabold text-lg text-slate-800 mt-0.5">เคลียร์บิล / ปิดกะ: ${dsp.RouteName}</h3>
+        </div>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <input type="hidden" id="cls-dsp-id" value="${dsp.DispatchID}">
+        <input type="hidden" id="cls-loaded-qty" value="${loadedQty}">
+
+        <div class="bg-slate-100 p-3 rounded-xl flex flex-wrap justify-between items-center gap-2 text-xs">
+          <div>👤 คนขับ: <b class="text-slate-900">${dsp.DriverName}</b> (${dsp.VehicleID || 'ไม่ระบุทะเบียน'})</div>
+          <div class="flex items-center gap-2">
+            <span>🛣️ ไมล์ออก: <b>${startMile.toLocaleString()}</b></span>
+            <span>➔ ไมล์จบ:</span>
+            <input type="number" id="cls-end-mile" value="${endMile > 0 ? endMile : ''}" placeholder="ระบุไมล์จบ" class="w-24 p-1 bg-white border-2 ${endMile > 0 ? 'border-emerald-400' : 'border-amber-400'} rounded-lg text-center font-black text-blue-700">
+          </div>
+        </div>
+
+        <div class="bg-blue-50/50 p-3.5 rounded-2xl border border-blue-200 space-y-2.5">
+          <div class="flex justify-between items-center">
+            <h4 class="text-xs font-extrabold text-blue-950 flex items-center gap-1.5">
+              <i data-lucide="package-search" class="w-4 h-4 text-blue-600"></i> 1. กระทบยอดสต๊อกน้ำแข็งบนรถ (หน่วย)
+            </h4>
+            <span id="cls-loss-badge" class="text-[11px] font-extrabold px-2.5 py-0.5 rounded-full"></span>
+          </div>
+
+          <div class="grid grid-cols-4 gap-2 text-center">
+            <div class="bg-white p-2 rounded-xl border border-slate-200">
+              <p class="text-[10px] font-bold text-slate-500">เบิกสุทธิ</p>
+              <p class="text-base font-black text-slate-800">${loadedQty}</p>
+            </div>
+            <div class="bg-white p-2 rounded-xl border border-blue-200">
+              <p class="text-[10px] font-bold text-blue-700">ขายตามบิล</p>
+              <input type="number" id="cls-sold-qty" value="${soldQty}" oninput="recalcSettlement()" class="w-full text-center font-black text-base text-blue-700 outline-none">
+            </div>
+            <div class="bg-white p-2 rounded-xl border border-emerald-300">
+              <p class="text-[10px] font-bold text-emerald-700">ตีคืนคลัง</p>
+              <input type="number" id="cls-ret-qty" value="0" oninput="recalcSettlement()" class="w-full text-center font-black text-base text-emerald-700 outline-none">
+            </div>
+            <div class="bg-white p-2 rounded-xl border border-rose-200">
+              <p class="text-[10px] font-bold text-rose-600">หาย/ละลาย</p>
+              <p id="cls-loss-qty" class="text-base font-black text-rose-600">0</p>
+            </div>
+          </div>
+
+          ${returnItemsHTML ? `
+            <div class="pt-1 space-y-1">
+              <p class="text-[10px] font-bold text-slate-600">📦 ระบุจำนวนน้ำแข็งที่เหลือตีคืนเข้าห้องเย็น (แยกตามชนิดเพื่อบวกสต๊อกกลับ):</p>
+              ${returnItemsHTML}
+            </div>
+          ` : ''}
+        </div>
+
+        <div class="bg-slate-50 p-3.5 rounded-2xl border border-slate-200 space-y-2.5">
+          <h4 class="text-xs font-extrabold text-slate-800 flex items-center gap-1.5">
+            <i data-lucide="coins" class="w-4 h-4 text-emerald-600"></i> 2. ยอดเงินตามบิลในระบบ & หักค่าใช้จ่ายหน้างาน
+          </h4>
+
+          <div class="grid grid-cols-2 gap-2 text-xs bg-white p-2.5 rounded-xl border border-slate-200">
+            <div class="flex justify-between"><span>💵 ขายน้ำแข็งรับเงินสด:</span><b class="text-emerald-700">฿${cashOnlySales.toLocaleString()}</b></div>
+            <div class="flex justify-between"><span>🤝 เก็บหนี้เก่า (เงินสด):</span><b class="text-purple-700">+฿${debtCash.toLocaleString()}</b></div>
+            <div class="flex justify-between"><span>📱 ยอดโอนเข้าธนาคาร:</span><b class="text-blue-600">฿${(trfSales + debtTransfer).toLocaleString()}</b></div>
+            <div class="flex justify-between"><span>💳 ลูกค้าเซ็นบิลเชื่อวันนี้:</span><b class="text-amber-600">฿${crdSales.toLocaleString()}</b></div>
+          </div>
+
+          <div class="grid grid-cols-3 gap-2">
+            <div>
+              <label class="text-[10px] font-bold text-emerald-700">รวมเงินสดรับ (ขาย+หนี้)</label>
+              <input type="number" id="cls-cash-sales" value="${totalCashIn}" oninput="recalcSettlement()" class="w-full mt-1 p-2 border border-emerald-300 rounded-xl font-bold text-emerald-700 bg-white text-xs">
+            </div>
+            <div>
+              <label class="text-[10px] font-bold text-blue-700">ยอดโอนรวม (฿)</label>
+              <input type="number" id="cls-trf-sales" value="${trfSales}" class="w-full mt-1 p-2 border border-blue-200 rounded-xl font-bold text-blue-700 bg-white text-xs">
+            </div>
+            <div>
+              <label class="text-[10px] font-bold text-amber-700">บิลเชื่อวันนี้ (฿)</label>
+              <input type="number" id="cls-crd-sales" value="${crdSales}" class="w-full mt-1 p-2 border border-amber-200 rounded-xl font-bold text-amber-700 bg-white text-xs">
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2 pt-1">
+            <div>
+              <label class="text-[10px] font-extrabold text-rose-600">⛽ หักค่าน้ำมันจ่ายสด (ดึงอัตโนมัติ)</label>
+              <input type="number" id="cls-fuel-exp" value="${fuelCash}" oninput="recalcSettlement()" class="w-full mt-1 p-2 border-2 border-rose-300 rounded-xl font-black text-rose-600 bg-rose-50/30 text-sm">
+            </div>
+            <div>
+              <label class="text-[10px] font-bold text-rose-600">💸 หักค่าใช้จ่ายอื่นหน้างาน (฿)</label>
+              <input type="number" id="cls-oth-exp" value="0" oninput="recalcSettlement()" class="w-full mt-1 p-2 border border-rose-200 rounded-xl font-bold text-rose-600 bg-white text-sm">
+            </div>
+          </div>
+        </div>
+
+        <div class="bg-emerald-50 p-4 rounded-2xl border-2 border-emerald-500 space-y-2">
+          <div class="flex justify-between items-center">
+            <div>
+              <span class="text-xs font-extrabold text-emerald-950 block">ยอดเงินสดสุทธิที่ต้องส่งเสมียนตามระบบ:</span>
+              <span class="text-[10px] text-emerald-700">(ขายสด ฿${cashOnlySales.toLocaleString()} + เก็บหนี้สด ฿${debtCash.toLocaleString()} - น้ำมัน/จ่ายอื่น)</span>
+            </div>
+            <span id="cls-expected-cash" class="text-2xl font-black text-emerald-800" data-exp="0">฿0</span>
+          </div>
+          <div class="pt-1">
+            <label class="text-xs font-extrabold text-slate-800 block mb-1">💵 เงินสดที่เสมียนนับได้จริงหน้าลาน (฿) *</label>
+            <input type="number" id="cls-actual-cash" oninput="recalcSettlement()" class="w-full p-3 border-2 border-emerald-600 rounded-xl font-black text-2xl text-emerald-900 bg-white text-center outline-none">
+          </div>
+          <div class="flex justify-between items-center pt-1">
+            <input type="text" id="cls-note" placeholder="หมายเหตุปิดกะ (เช่น เหตุผลที่น้ำแข็งละลาย/เงินขาด)..." class="flex-1 mr-3 p-1.5 bg-white border border-emerald-200 rounded-lg text-xs">
+            <p id="cls-diff-label" class="text-xs font-extrabold shrink-0"></p>
+          </div>
+        </div>
+
+        <div class="flex justify-end gap-2 pt-2">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="saveCloseDispatch()" class="px-6 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-extrabold shadow-md text-sm flex items-center gap-1.5">
+            <i data-lucide="check-circle-2" class="w-4 h-4"></i> ยืนยันปิดกะ & รับคืนสต๊อก
+          </button>
+        </div>
+      </div>
+    `;
+
+    openModal(html);
+    const expInit = totalCashIn - fuelCash;
+    document.getElementById('cls-actual-cash').value = expInit;
+    recalcSettlement();
+  }
+
+  function syncReturnItemsTotal() {
+    let sumRet = 0;
+    document.querySelectorAll('.cls-ret-item').forEach(inp => { sumRet += parseFloat(inp.value) || 0; });
+    const retEl = document.getElementById('cls-ret-qty');
+    if (retEl) retEl.value = sumRet;
+    recalcSettlement();
+  }
+
+  function recalcSettlement() {
+    const loadedQty = parseFloat(document.getElementById('cls-loaded-qty')?.value) || 0;
+    const soldQty = parseFloat(document.getElementById('cls-sold-qty')?.value) || 0;
+    const retQty = parseFloat(document.getElementById('cls-ret-qty')?.value) || 0;
+    const lossQty = loadedQty - soldQty - retQty;
+
+    const lossEl = document.getElementById('cls-loss-qty');
+    const lossBadge = document.getElementById('cls-loss-badge');
+    if (lossEl && lossBadge) {
+      lossEl.innerText = lossQty;
+      if (lossQty === 0) {
+        lossBadge.innerText = '✅ สต๊อกน้ำแข็งครบ 100%';
+        lossBadge.className = 'text-[11px] font-extrabold px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800';
+      } else if (lossQty > 0) {
+        lossBadge.innerText = `🚨 น้ำแข็งหาย/ละลาย ${lossQty} หน่วย!`;
+        lossBadge.className = 'text-[11px] font-extrabold px-2.5 py-0.5 rounded-full bg-rose-600 text-white animate-pulse';
+      } else {
+        lossBadge.innerText = `⚠️ ขาย+คืน เกินยอดเบิก ${Math.abs(lossQty)} หน่วย`;
+        lossBadge.className = 'text-[11px] font-extrabold px-2.5 py-0.5 rounded-full bg-amber-100 text-amber-800';
+      }
+    }
+
+    const cashSales = parseFloat(document.getElementById('cls-cash-sales')?.value) || 0;
+    const fuel = parseFloat(document.getElementById('cls-fuel-exp')?.value) || 0;
+    const oth = parseFloat(document.getElementById('cls-oth-exp')?.value) || 0;
+    const actual = parseFloat(document.getElementById('cls-actual-cash')?.value) || 0;
+
+    const expected = cashSales - fuel - oth;
+    const diff = actual - expected;
+
+    const expEl = document.getElementById('cls-expected-cash');
+    if (expEl) {
+      expEl.innerText = '฿' + expected.toLocaleString();
+      expEl.setAttribute('data-exp', expected);
+    }
+
+    const diffEl = document.getElementById('cls-diff-label');
+    if (diffEl) {
+      if (diff === 0) {
+        diffEl.innerText = '✅ เงินสดครบพอดี (฿0)';
+        diffEl.className = 'text-xs font-extrabold text-emerald-700';
+      } else if (diff < 0) {
+        diffEl.innerText = `🚨 เงินสดขาด ฿${Math.abs(diff).toLocaleString()}`;
+        diffEl.className = 'text-xs font-extrabold text-rose-600';
+      } else {
+        diffEl.innerText = `💡 เงินสดเกิน +฿${diff.toLocaleString()}`;
+        diffEl.className = 'text-xs font-extrabold text-blue-600';
+      }
+    }
+  }
+
+  async function saveCloseDispatch() {
+    const dspId = document.getElementById('cls-dsp-id').value;
+    const dsp = (STATE.route.dispatches || []).find(x => String(x.DispatchID) === String(dspId)) || {};
+
+    const loadedQty = parseFloat(document.getElementById('cls-loaded-qty')?.value) || 0;
+    const soldQty = parseFloat(document.getElementById('cls-sold-qty')?.value) || 0;
+    const retQty = parseFloat(document.getElementById('cls-ret-qty')?.value) || 0;
+    const lossQty = Math.max(0, loadedQty - soldQty - retQty);
+
+    const expCash = parseFloat(document.getElementById('cls-expected-cash')?.getAttribute('data-exp')) || 0;
+    const actCash = parseFloat(document.getElementById('cls-actual-cash')?.value) || 0;
+    const cashDiff = actCash - expCash;
+
+    if (lossQty > 0 || cashDiff < 0) {
+      const warnMsg = `⚠️ พบความผิดปกติในการปิดกะ:\n` +
+        (lossQty > 0 ? `- น้ำแข็งสูญหาย/ละลาย: ${lossQty} หน่วย\n` : '') +
+        (cashDiff < 0 ? `- เงินสดส่งมอบขาดไป: ฿${Math.abs(cashDiff).toLocaleString()}\n` : '') +
+        `\nคุณตรวจสอบกับคนขับและยืนยันจะบันทึกปิดกะนี้ใช่หรือไม่?`;
+      if (!confirm(warnMsg)) return;
+    }
+
+    const returnItems = [];
+    document.querySelectorAll('.cls-ret-item').forEach(inp => {
+      const q = parseFloat(inp.value) || 0;
+      if (q > 0) {
+        returnItems.push({ id: inp.getAttribute('data-id'), name: inp.getAttribute('data-name'), qty: q });
+      }
+    });
+
+    const payload = {
+      DispatchID: dspId,
+      SoldQty: soldQty,
+      ReturnedQty: retQty,
+      EndMileage: document.getElementById('cls-end-mile').value,
+      CashSales: document.getElementById('cls-cash-sales').value,
+      TransferSales: document.getElementById('cls-trf-sales').value,
+      CreditSales: document.getElementById('cls-crd-sales').value,
+      FuelExpense: document.getElementById('cls-fuel-exp').value,
+      OtherExpense: document.getElementById('cls-oth-exp').value,
+      ActualCash: actCash,
+      CloseNote: document.getElementById('cls-note')?.value.trim() || '',
+      ReturnItems: returnItems
+    };
+
+    try {
+      await apiCall('closeDispatch', payload);
+      closeModal();
+      showToast('ปิดกะสายส่งและรับคืนสต๊อกเรียบร้อย กำลังพิมพ์รายงานสรุปประจำกะ (A4)...');
+      printOfficeCloseShiftA4Report(dsp, payload);
+      await renderSettlement();
+    } catch (e) {}
+  }
+
+  // 🖨️ ฟังก์ชันพิมพ์รายงานสรุปการส่งน้ำแข็งประจำกะ (A4) เหมือนของพนักงานส่งทุกประการ
+  function printOfficeCloseShiftA4Report(dsp, closePayload) {
+    const now = new Date().toLocaleString('th-TH');
+    const startM = parseFloat(dsp.StartMileage) || 0;
+    const endM = parseFloat(closePayload.EndMileage) || parseFloat(dsp.EndMileage) || 0;
+    const distKm = (startM > 0 && endM >= startM) ? (endM - startM) : 0;
+
+    const cashOnlySales = parseFloat(dsp.LiveCashOnlySales) || 0;
+    const debtCash = parseFloat(dsp.LiveDebtCash) || 0;
+    const transferSales = parseFloat(closePayload.TransferSales) || 0;
+    const creditSales = parseFloat(closePayload.CreditSales) || 0;
+    const totalSales = cashOnlySales + transferSales + creditSales;
+    const fuelCash = parseFloat(closePayload.FuelExpense) || 0;
+    const otherExp = parseFloat(closePayload.OtherExpense) || 0;
+    const actualCash = parseFloat(closePayload.ActualCash) || 0;
+
+    const noteParts = String(dsp.Note || '').split('|').map(s => s.trim()).filter(s => s !== '');
+    const loadHistoryText = noteParts.map((part, idx) => `รอบที่ ${idx + 1}: ${part.replace(/^เบิก:\s*/, '')}`).join('  |  ');
+
+    const retMap = {};
+    (closePayload.ReturnItems || []).forEach(r => { retMap[String(r.id)] = parseFloat(r.qty) || 0; });
+    const stockSummaryText = (dsp.ItemBreakdown || []).map(itm => {
+      const rQty = retMap[String(itm.id)] !== undefined ? retMap[String(itm.id)] : itm.expectedRemain;
+      return `${itm.name}: เบิก ${itm.loadedQty} | ขาย ${itm.soldQty} | คืนคลัง ${rQty}`;
+    }).join('  •  ');
+
+    const boughtList = dsp.ReportBoughtList || [];
+    const boughtRows = boughtList.map((info, idx) => `
+      <tr>
+        <td style="padding: 5px; border: 1px solid #cbd5e1; text-align: center;">${idx + 1}</td>
+        <td style="padding: 5px; border: 1px solid #cbd5e1;"><b>${info.CustomerName}</b></td>
+        <td style="padding: 5px; border: 1px solid #cbd5e1; text-align: center;">${info.lastTime || '-'} น.</td>
+        <td style="padding: 5px; border: 1px solid #cbd5e1;">${(info.summaries || []).join('<br>')}</td>
+        <td style="padding: 5px; border: 1px solid #cbd5e1; text-align: center; font-weight: bold;">${info.totalQty || 0}</td>
+        <td style="padding: 5px; border: 1px solid #cbd5e1; text-align: right; font-weight: bold;">฿${Number(info.totalAmt || 0).toLocaleString()}</td>
+      </tr>
+    `).join('');
+
+    const missedList = dsp.ReportMissedList || [];
+    const missedRows = missedList.map((c, idx) => `
+      <tr>
+        <td style="padding: 5px; border: 1px solid #cbd5e1; text-align: center;">${idx + 1}</td>
+        <td style="padding: 5px; border: 1px solid #cbd5e1; font-weight: bold; color: #b91c1c;">${c.CustomerName}</td>
+        <td style="padding: 5px; border: 1px solid #cbd5e1; text-align: center;">${c.Phone || '-'}</td>
+        <td style="padding: 5px; border: 1px solid #cbd5e1; text-align: right; font-weight: bold; color: ${c.TotalDebt > 0 ? '#dc2626' : '#64748b'};">${c.TotalDebt > 0 ? 'ค้าง ฿' + Number(c.TotalDebt).toLocaleString() : '-'}</td>
+        <td style="padding: 5px; border: 1px solid #cbd5e1; text-align: center; color: #b91c1c; font-weight: bold;">ไม่ได้ลงน้ำแข็งวันนี้</td>
+      </tr>
+    `).join('');
+
+    const reportHTML = `
+      <div id="close-shift-a4-print" style="background: #ffffff; padding: 4mm; font-family: 'Prompt', sans-serif; color: #000;">
+        <div style="border-bottom: 2px solid #0f172a; padding-bottom: 8px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: flex-end;">
+          <div>
+            <h1 style="font-size: 16px; font-weight: 800; margin: 0;">โรงน้ำแข็งแม่ใจ — รายงานสรุปการส่งน้ำแข็งประจำกะ (Route Audit Report)</h1>
+            <p style="font-size: 11px; margin: 2px 0 0 0; color: #334155;">รหัสกะ: <b>${dsp.DispatchID || '-'}</b> | สายส่ง: <b>${dsp.RouteName || '-'}</b> | คนขับ: <b>${dsp.DriverName || '-'}</b> | รถ: <b>${dsp.VehicleID || '-'}</b> | ไมล์: ${startM} → ${endM} (${distKm} กม.)</p>
+          </div>
+          <div style="text-align: right; font-size: 10px; color: #475569;">ปิดกะเมื่อ: ${now}</div>
+        </div>
+
+        <table style="width: 100%; border-collapse: collapse; font-size: 11px; margin-bottom: 8px;">
+          <tr style="background: #f1f5f9; font-weight: bold; text-align: center;">
+            <td style="padding: 6px; border: 1px solid #cbd5e1;">ยอดขายรวม<br><b style="font-size: 13px;">฿${totalSales.toLocaleString()}</b></td>
+            <td style="padding: 6px; border: 1px solid #cbd5e1; color: #047857;">ขายเงินสด<br><b style="font-size: 13px;">฿${cashOnlySales.toLocaleString()}</b></td>
+            <td style="padding: 6px; border: 1px solid #cbd5e1; color: #1d4ed8;">ขายโอน<br><b style="font-size: 13px;">฿${transferSales.toLocaleString()}</b></td>
+            <td style="padding: 6px; border: 1px solid #cbd5e1; color: #b45309;">ขายบิลเชื่อ<br><b style="font-size: 13px;">฿${creditSales.toLocaleString()}</b></td>
+            <td style="padding: 6px; border: 1px solid #cbd5e1; color: #6d28d9;">เก็บหนี้สด<br><b style="font-size: 13px;">+฿${debtCash.toLocaleString()}</b></td>
+            <td style="padding: 6px; border: 1px solid #cbd5e1; color: #be123c;">หักน้ำมัน/อื่นๆ<br><b style="font-size: 13px;">-฿${(fuelCash + otherExp).toLocaleString()}</b></td>
+            <td style="padding: 6px; border: 1px solid #cbd5e1; background: #ecfdf5; color: #065f46;">เงินสดรับจริงเข้าเซฟ<br><b style="font-size: 14px;">฿${actualCash.toLocaleString()}</b></td>
+          </tr>
+        </table>
+
+        <div style="font-size: 10px; padding: 5px 8px; background: #f8fafc; border: 1px solid #cbd5e1; margin-bottom: 4px;">
+          <b>📦 ประวัติการเบิกน้ำแข็งขึ้นรถ:</b> ${loadHistoryText || '-'}
+        </div>
+        <div style="font-size: 10px; padding: 5px 8px; background: #f8fafc; border: 1px solid #cbd5e1; margin-bottom: 12px;">
+          <b>🧊 สรุปสต๊อกน้ำแข็งบนรถ (เบิกสุทธิ ${dsp.LoadedQty || 0} | ขาย ${closePayload.SoldQty || 0} | คืนคลัง ${closePayload.ReturnedQty || 0}):</b> ${stockSummaryText || '-'}
+        </div>
+
+        <h3 style="font-size: 12px; font-weight: 800; margin: 0 0 6px 0; color: #065f46;">✅ 1. รายชื่อร้านค้าที่ซื้อ/ลงน้ำแข็งวันนี้ (${boughtList.length} รายการ)</h3>
+        <table style="width: 100%; border-collapse: collapse; font-size: 10.5px; margin-bottom: 14px;">
+          <thead>
+            <tr style="background: #f1f5f9;">
+              <th style="padding: 5px; border: 1px solid #cbd5e1; width: 6%;">#</th>
+              <th style="padding: 5px; border: 1px solid #cbd5e1; width: 24%; text-align: left;">ชื่อร้านค้า</th>
+              <th style="padding: 5px; border: 1px solid #cbd5e1; width: 10%;">เวลา</th>
+              <th style="padding: 5px; border: 1px solid #cbd5e1; width: 40%; text-align: left;">รายการน้ำแข็งที่ลง & การชำระเงิน</th>
+              <th style="padding: 5px; border: 1px solid #cbd5e1; width: 8%;">หน่วย</th>
+              <th style="padding: 5px; border: 1px solid #cbd5e1; width: 12%; text-align: right;">ยอดเงินรวม</th>
+            </tr>
+          </thead>
+          <tbody>${boughtRows || '<tr><td colspan="6" style="padding: 10px; text-align: center; border: 1px solid #cbd5e1;">ยังไม่มีรายการขายในวันนี้</td></tr>'}</tbody>
+        </table>
+
+        <h3 style="font-size: 12px; font-weight: 800; margin: 0 0 6px 0; color: #b91c1c;">🚨 2. รายชื่อร้านค้าประจำในสายส่งที่ "ไม่ได้ลงน้ำแข็ง" ในวันนี้ (${missedList.length} ร้าน)</h3>
+        <table style="width: 100%; border-collapse: collapse; font-size: 10.5px; margin-bottom: 18px;">
+          <thead>
+            <tr style="background: #fef2f2;">
+              <th style="padding: 5px; border: 1px solid #cbd5e1; width: 6%;">#</th>
+              <th style="padding: 5px; border: 1px solid #cbd5e1; width: 34%; text-align: left;">ชื่อร้านค้า</th>
+              <th style="padding: 5px; border: 1px solid #cbd5e1; width: 20%;">เบอร์โทรศัพท์</th>
+              <th style="padding: 5px; border: 1px solid #cbd5e1; width: 18%; text-align: right;">หนี้ค้างสะสม</th>
+              <th style="padding: 5px; border: 1px solid #cbd5e1; width: 22%;">สถานะวันนี้</th>
+            </tr>
+          </thead>
+          <tbody>${missedRows || '<tr><td colspan="5" style="padding: 10px; text-align: center; border: 1px solid #cbd5e1; color: #059669; font-weight: bold;">🎉 ส่งน้ำแข็งครบทุกร้านในสายส่งแล้ว!</td></tr>'}</tbody>
+        </table>
+
+        <div style="display: flex; justify-content: space-around; font-size: 11px; margin-top: 24px; text-align: center;">
+          <div>ลงชื่อ..................................................พนักงานขับรถ<br>(${dsp.DriverName || ''})</div>
+          <div>ลงชื่อ..................................................เสมียนผู้รับเงิน/ตรวจสต๊อก<br>(..................................................)</div>
+        </div>
+      </div>
+    `;
+
+    const view = document.getElementById('app-view');
+    const prevHTML = view.innerHTML;
+    view.innerHTML = `<div id="print-area">${reportHTML}</div>`;
+    document.body.classList.add('print-report');
+    window.print();
+    document.body.classList.remove('print-report');
+    view.innerHTML = prevHTML;
+  }
+
+  // ==========================================
+  // ⛽ 5. FUEL LOG MODAL (บันทึกบิลน้ำมันเชื้อเพลิง)
+  // ==========================================
+  function openFuelModal() {
+    const d = STATE.route || {};
+    const vOpts = (d.vehicles || []).map(v => `<option value="${escStr(v.LicensePlate)}">${v.LicensePlate}</option>`).join('');
+    const eOpts = (d.employees || []).map(e => `<option value="${escStr(e.EmpName)}">${e.EmpName}</option>`).join('');
+
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-4">
+        <h3 class="font-extrabold text-lg text-slate-800 flex items-center gap-2">
+          <i data-lucide="fuel" class="w-5 h-5 text-amber-500"></i> บันทึกบิลน้ำมันเชื้อเพลิง
+        </h3>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">ทะเบียนรถ *</label>
+            <select id="fl-vehicle" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold">${vOpts}</select>
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">คนขับรถ *</label>
+            <select id="fl-driver" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold">${eOpts}</select>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">เลขไมล์ตอนเติม (กม.) *</label>
+            <input type="number" id="fl-mileage" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold text-center" placeholder="เช่น 125480">
+          </div>
+          <div>
+            <label class="text-xs font-bold text-rose-600">ยอดเงินรวม (บาท) *</label>
+            <input type="number" id="fl-cost" class="w-full mt-1 p-2.5 border-2 border-rose-300 rounded-xl font-black text-rose-600 text-right" placeholder="0">
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">ชำระโดย</label>
+            <select id="fl-paidby" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold text-slate-700">
+              <option value="หักเงินสดสายส่ง">💵 หักเงินสดสายส่ง</option>
+              <option value="เงินสดหน้าลาน">🏠 เงินสดหน้าลาน</option>
+              <option value="บิลเครดิตปั๊ม">💳 เซ็นบิลเครดิตปั๊ม</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">จำนวนลิตร (ถ้าทราบ)</label>
+            <input type="number" id="fl-liters" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl text-right" placeholder="0">
+          </div>
+        </div>
+
+        <input type="text" id="fl-note" class="w-full p-2.5 border border-slate-200 rounded-xl text-xs" placeholder="หมายเหตุเพิ่มเติม...">
+
+        <div class="flex justify-end gap-2 pt-2">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="saveFuelModal()" class="px-6 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-extrabold shadow-md text-xs">บันทึกบิลน้ำมัน</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  }
+
+  async function saveFuelModal() {
+    const cost = parseFloat(document.getElementById('fl-cost').value) || 0;
+    const mile = parseFloat(document.getElementById('fl-mileage').value) || 0;
+    if (cost <= 0) return showToast('กรุณาระบุยอดเงินค่าน้ำมัน', 'error');
+
+    try {
+      await apiCall('saveFuelLog', {
+        VehicleID: document.getElementById('fl-vehicle').value,
+        DriverName: document.getElementById('fl-driver').value,
+        Mileage: mile,
+        Liters: document.getElementById('fl-liters').value,
+        TotalCost: cost,
+        PaidBy: document.getElementById('fl-paidby').value,
+        Note: document.getElementById('fl-note').value.trim()
+      });
+      closeModal();
+      showToast('บันทึกบิลน้ำมันสำเร็จ!');
+      renderSettlement();
+    } catch (e) {}
+  }
+
+  // ==========================================
+  // 🪣 6. BUCKET TRANSACTION MODAL (ยืม-คืนถังน้ำแข็งรายใบ)
+  // ==========================================
+  window.BUCKET_MODAL_MODE = 'OUT';
+
+  function openBucketTxModal(mode = 'OUT', preselectHolder = '', preselectSerial = '') {
+    window.BUCKET_MODAL_MODE = mode;
+    const custDatalist = (STATE.bucket.customers || []).map(c => `<option value="${escStr(c.CustomerName)}">`).join('');
+
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-3">
+        <h3 class="font-extrabold text-lg text-slate-800 flex items-center gap-2">
+          <i data-lucide="arrow-left-right" class="w-5 h-5 text-blue-600"></i> ทำรายการ ยืม-คืนถังน้ำแข็ง
+        </h3>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <div class="grid grid-cols-2 gap-2 bg-slate-100 p-1 rounded-xl">
+          <button id="bkt-tab-out" onclick="switchBucketModalMode('OUT', '')" class="py-2 rounded-lg font-extrabold text-xs transition">📤 ยืมถังออก (OUT)</button>
+          <button id="bkt-tab-in" onclick="switchBucketModalMode('IN', '${escStr(preselectHolder)}')" class="py-2 rounded-lg font-extrabold text-xs transition">📥 รับถังคืนคลัง (IN)</button>
+        </div>
+
+        <div id="bkt-out-fields" class="space-y-3">
+          <div class="grid grid-cols-2 gap-2">
+            <div>
+              <label class="text-xs font-bold text-slate-600">ประเภทการยืม</label>
+              <select id="bkt-loan-type" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold text-xs">
+                <option value="ถังยืมร้าน">🏪 ถังยืมร้านประจำ</option>
+                <option value="ถังยืมงาน">🎪 ถังยืมงานนอก (อีเวนต์)</option>
+              </select>
+            </div>
+            <div>
+              <label class="text-xs font-bold text-slate-600">ชื่อร้านค้า หรือ ชื่องานอีเวนต์ *</label>
+              <input list="bkt-cust-dl" id="bkt-holder-input" value="${escStr(preselectHolder)}" oninput="renderBucketSerialCheckboxes('${escStr(preselectSerial)}')" class="w-full mt-1 p-2.5 border-2 border-blue-300 rounded-xl font-bold text-xs outline-none" placeholder="พิมพ์ชื่อร้าน / ชื่องาน...">
+              <datalist id="bkt-cust-dl">${custDatalist}</datalist>
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div class="flex justify-between items-center mb-1.5">
+            <label id="bkt-list-label" class="text-xs font-extrabold text-slate-700">เลือกรหัสถัง (Serial)</label>
+            <input type="text" id="bkt-sn-search" oninput="renderBucketSerialCheckboxes('${escStr(preselectSerial)}')" placeholder="🔍 ค้นหาเบอร์ถัง..." class="w-36 px-2.5 py-1 border border-slate-200 rounded-lg text-xs">
+          </div>
+          <div id="bkt-serial-box" class="grid grid-cols-3 sm:grid-cols-4 gap-2 max-h-[220px] overflow-y-auto p-2 bg-slate-50 rounded-xl border border-slate-200"></div>
+        </div>
+
+        <input type="text" id="bkt-note" class="w-full p-2.5 border border-slate-200 rounded-xl text-xs" placeholder="หมายเหตุ (เช่น สภาพถัง, คนขับที่นำไปส่ง)...">
+
+        <div class="flex justify-end gap-2 pt-2">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="saveBucketTxModal()" class="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-extrabold shadow-md text-xs">ยืนยันทำรายการ</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+    switchBucketModalMode(mode, preselectHolder, preselectSerial);
+  }
+
+  function switchBucketModalMode(mode, holder = '', preselectSerial = '') {
+    window.BUCKET_MODAL_MODE = mode;
+    const btnOut = document.getElementById('bkt-tab-out');
+    const btnIn = document.getElementById('bkt-tab-in');
+    const outFields = document.getElementById('bkt-out-fields');
+    const holderInp = document.getElementById('bkt-holder-input');
+
+    if (mode === 'OUT') {
+      btnOut.className = 'py-2 rounded-lg font-extrabold text-xs bg-blue-600 text-white shadow-xs';
+      btnIn.className = 'py-2 rounded-lg font-extrabold text-xs text-slate-600';
+      outFields.classList.remove('hidden');
+      document.getElementById('bkt-list-label').innerText = '🟢 เลือกถังที่พร้อมใช้ในคลัง:';
+    } else {
+      btnIn.className = 'py-2 rounded-lg font-extrabold text-xs bg-emerald-600 text-white shadow-xs';
+      btnOut.className = 'py-2 rounded-lg font-extrabold text-xs text-slate-600';
+      if (holder && holderInp) holderInp.value = holder;
+      document.getElementById('bkt-list-label').innerText = holder ? `🔴 เลือกถังที่ค้างอยู่กับ "${holder}":` : '🔴 เลือกถังที่ถูกยืมออกไป:';
+    }
+    renderBucketSerialCheckboxes(preselectSerial);
+  }
+
+  function renderBucketSerialCheckboxes(preselectSerial = '') {
+    const box = document.getElementById('bkt-serial-box');
+    if (!box) return;
+    const mode = window.BUCKET_MODAL_MODE;
+    const q = (document.getElementById('bkt-sn-search')?.value || '').toLowerCase();
+    const holderFilter = (document.getElementById('bkt-holder-input')?.value || '').trim().toLowerCase();
+
+    const all = STATE.bucket.allBuckets || [];
+    const targetList = all.filter(b => {
+      if (mode === 'OUT' && b.CurrentStatus !== 'ในคลัง') return false;
+      if (mode === 'IN' && b.CurrentStatus !== 'ถูกยืม') return false;
+      if (mode === 'IN' && holderFilter && !String(b.CurrentLocation || '').toLowerCase().includes(holderFilter)) return false;
+      if (q && !String(b.SerialNumber).toLowerCase().includes(q) && !String(b.CurrentLocation || '').toLowerCase().includes(q)) return false;
+      return true;
+    });
+
+    box.innerHTML = targetList.map(b => {
+      const isPre = preselectSerial && String(b.SerialNumber) === String(preselectSerial);
+      return `
+        <label class="flex items-center gap-1.5 p-2 bg-white border border-slate-200 rounded-xl cursor-pointer hover:border-blue-400 text-xs">
+          <input type="checkbox" class="bkt-sn-chk w-4 h-4 accent-blue-600" value="${escStr(b.SerialNumber)}" ${isPre ? 'checked' : ''}>
+          <div class="truncate">
+            <span class="font-extrabold text-slate-800">${b.SerialNumber}</span>
+            <span class="text-[9px] text-slate-400 block truncate">${mode === 'IN' ? b.CurrentLocation : b.Capacity}</span>
+          </div>
+        </label>
+      `;
+    }).join('') || `<p class="col-span-full text-center py-6 text-xs text-slate-400">ไม่พบรายการถังในหมวดนี้</p>`;
+  }
+
+  async function saveBucketTxModal() {
+    const mode = window.BUCKET_MODAL_MODE;
+    const serials = [];
+    document.querySelectorAll('.bkt-sn-chk:checked').forEach(chk => serials.push(chk.value));
+    if (serials.length === 0) return showToast('กรุณาติ๊กเลือกเบอร์ถังอย่างน้อย 1 ใบ', 'error');
+
+    const holderName = document.getElementById('bkt-holder-input')?.value.trim() || '';
+    if (mode === 'OUT' && !holderName) return showToast('กรุณาระบุชื่อร้านค้าหรือชื่องานอีเวนต์', 'error');
+
+    try {
+      await apiCall('saveBucketTransaction', {
+        mode: mode,
+        Serials: serials,
+        CustomerName: holderName,
+        LoanType: document.getElementById('bkt-loan-type')?.value || 'ถังยืมร้าน',
+        Note: document.getElementById('bkt-note')?.value.trim() || ''
+      });
+      closeModal();
+      showToast(mode === 'OUT' ? `บันทึกยืมถังออก ${serials.length} ใบ สำเร็จ!` : `รับคืนถังเข้าคลัง ${serials.length} ใบ สำเร็จ!`);
+      renderBuckets();
+    } catch (e) {}
+  }
+
+  // ==========================================
+  // 🗃️ 7. BUCKET MASTER REGISTER MODAL (ลงทะเบียน/แก้ไขถังน้ำแข็งรายใบ)
+  // ==========================================
+  function openBucketRegisterModal(bucketId = '') {
+    const b = bucketId ? (STATE.bucketMaster.list || []).find(x => x.BucketID === bucketId) : null;
+    const custDatalist = (STATE.bucketMaster.customers || []).map(c => `<option value="${escStr(c.CustomerName)}">`).join('');
+
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-4">
+        <h3 class="font-extrabold text-lg text-slate-800">${b ? 'แก้ไขข้อมูลถัง: ' + b.SerialNumber : 'ลงทะเบียนถังน้ำแข็งใหม่'}</h3>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <input type="hidden" id="bm-id" value="${b ? b.BucketID : ''}">
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">หมายเลขถัง (Serial Number) *</label>
+            <input type="text" id="bm-serial" value="${b ? escStr(b.SerialNumber) : ''}" class="w-full mt-1 p-2.5 border-2 border-blue-200 rounded-xl font-black text-blue-900" placeholder="เช่น 6023">
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">ขนาดความจุ (ลิตร)</label>
+            <select id="bm-cap" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold">
+              ${['100L', '150L', '200L', '300L', '450L', '800L', '1000L'].map(c => `<option value="${c}" ${b && b.Capacity === c ? 'selected' : ''}>${c}</option>`).join('')}
+            </select>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">ประเภทถัง</label>
+            <select id="bm-type" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold">
+              <option value="ถังยืมร้าน" ${b && b.BucketType === 'ถังยืมร้าน' ? 'selected' : ''}>ถังยืมร้านประจำ</option>
+              <option value="ถังยืมงาน" ${b && b.BucketType === 'ถังยืมงาน' ? 'selected' : ''}>ถังยืมงานนอก (อีเวนต์)</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">สถานะปัจจุบัน</label>
+            <select id="bm-status" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold">
+              <option value="ในคลัง" ${b && b.CurrentStatus === 'ในคลัง' ? 'selected' : ''}>🟢 ในคลัง (พร้อมใช้)</option>
+              <option value="ถูกยืม" ${b && b.CurrentStatus === 'ถูกยืม' ? 'selected' : ''}>🔴 ถูกยืม (อยู่กับลูกค้า)</option>
+              <option value="ส่งซ่อม" ${b && b.CurrentStatus === 'ส่งซ่อม' ? 'selected' : ''}>🟠 ส่งซ่อม / ชำรุด</option>
+            </select>
+          </div>
+        </div>
+
+        <div>
+          <label class="text-xs font-bold text-slate-600">สถานที่ตั้งปัจจุบัน / ชื่อผู้ยืม</label>
+          <input list="bm-cust-dl" id="bm-loc" value="${b ? escStr(b.CurrentLocation) : 'โรงงานแม่ใจ'}" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-semibold">
+          <datalist id="bm-cust-dl">${custDatalist}</datalist>
+        </div>
+
+        <div>
+          <label class="text-xs font-bold text-slate-600">หมายเหตุ</label>
+          <input type="text" id="bm-note" value="${b ? escStr(b.Note || '') : ''}" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl text-xs" placeholder="สภาพถัง / ตำหนิ...">
+        </div>
+
+        <div class="flex justify-end gap-2 pt-2">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="saveBucketRegisterModal()" class="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-extrabold shadow-md text-xs">บันทึกข้อมูลถัง</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  }
+
+  async function saveBucketRegisterModal() {
+    const sn = document.getElementById('bm-serial').value.trim();
+    if (!sn) return showToast('กรุณาระบุหมายเลขถัง (Serial Number)', 'error');
+
+    try {
+      await apiCall('saveBucketRecord', {
+        BucketID: document.getElementById('bm-id').value,
+        SerialNumber: sn,
+        Capacity: document.getElementById('bm-cap').value,
+        BucketType: document.getElementById('bm-type').value,
+        CurrentStatus: document.getElementById('bm-status').value,
+        CurrentLocation: document.getElementById('bm-loc').value.trim(),
+        Note: document.getElementById('bm-note').value.trim()
+      });
+      closeModal();
+      showToast('บันทึกทะเบียนถังสำเร็จ!');
+      renderBucketMaster();
+    } catch (e) {}
+  }
+
+  // ==========================================
+  // 💳 8. PAYMENT MODAL (รับชำระหนี้ค้าง AR Collection)
+  // ==========================================
+  function openPaymentModal(customerId) {
+    const c = (STATE.credit.debtList || []).find(x => x.CustomerID === customerId);
+    if (!c) return;
+
+    const billRows = (c.Bills || []).map(b => `
+      <label class="flex items-center justify-between p-3 bg-amber-50/50 border border-amber-200 rounded-xl cursor-pointer hover:bg-amber-50">
+        <div class="flex items-center gap-2.5 min-w-0 pr-2">
+          <input type="checkbox" class="pay-bill-chk w-4 h-4 accent-blue-600" value="${b.SaleID}" data-amt="${b.TotalAmount}" checked onchange="recalcPaymentModal()">
+          <div class="truncate">
+            <p class="text-xs font-extrabold text-slate-800">${String(b.SaleDate).slice(0, 10)} <span class="font-mono text-[10px] text-slate-400">(${b.SaleID})</span></p>
+            <p class="text-[11px] text-slate-600 truncate">${b.ItemSummary || 'บิลค้างชำระ'}</p>
+          </div>
+        </div>
+        <span class="font-black text-sm text-amber-800 shrink-0">฿${Number(b.TotalAmount).toLocaleString()}</span>
+      </label>
+    `).join('');
+
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-3">
+        <div>
+          <span class="text-[10px] font-bold bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">รับชำระหนี้ลูกหนี้การค้า</span>
+          <h3 class="font-extrabold text-lg text-slate-800 mt-0.5">${c.CustomerName} (${c.RouteName || 'หน้าลาน'})</h3>
+        </div>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <input type="hidden" id="pay-cust-id" value="${c.CustomerID}">
+        <input type="hidden" id="pay-cust-name" value="${escStr(c.CustomerName)}">
+
+        <div>
+          <label class="text-xs font-bold text-slate-600 block mb-1.5">ติ๊กเลือกบิลที่ลูกค้าชำระ (${c.Bills.length} บิล)</label>
+          <div class="space-y-1.5 max-h-[220px] overflow-y-auto pr-1">${billRows}</div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">ช่องทางรับชำระ</label>
+            <select id="pay-method" class="w-full mt-1 p-2.5 border-2 border-slate-200 rounded-xl font-bold text-slate-800">
+              <option value="เงินสด">💵 เงินสด</option>
+              <option value="โอนเงิน">📱 โอนเข้าบัญชีธนาคาร</option>
+            </select>
+          </div>
+          <div>
+            <label class="text-xs font-bold text-emerald-700">ยอดรับชำระรวม (฿)</label>
+            <input type="number" id="pay-amount" value="${c.TotalDebt}" class="w-full mt-1 p-2.5 border-2 border-emerald-400 rounded-xl font-black text-lg text-emerald-700 text-right bg-emerald-50/40">
+          </div>
+        </div>
+
+        <input type="text" id="pay-note" class="w-full p-2.5 border border-slate-200 rounded-xl text-xs" placeholder="หมายเหตุการรับชำระ (เช่น เวลาโอน)...">
+
+        <div class="flex justify-end gap-2 pt-2">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="savePaymentModal()" class="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-extrabold shadow-md text-xs flex items-center gap-1.5">
+            <i data-lucide="check-circle" class="w-4 h-4"></i> ยืนยันรับชำระหนี้
+          </button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  }
+
+  function recalcPaymentModal() {
+    let sum = 0;
+    document.querySelectorAll('.pay-bill-chk:checked').forEach(chk => { sum += parseFloat(chk.getAttribute('data-amt')) || 0; });
+    const el = document.getElementById('pay-amount');
+    if (el) el.value = sum;
+  }
+
+  async function savePaymentModal() {
+    const saleIds = [];
+    document.querySelectorAll('.pay-bill-chk:checked').forEach(chk => saleIds.push(chk.value));
+    if (saleIds.length === 0) return showToast('กรุณาติ๊กเลือกบิลอย่างน้อย 1 บิล', 'error');
+
+    const amt = parseFloat(document.getElementById('pay-amount').value) || 0;
+    try {
+      await apiCall('savePayment', {
+        CustomerID: document.getElementById('pay-cust-id').value,
+        CustomerName: document.getElementById('pay-cust-name').value,
+        SaleIDs: saleIds,
+        AmountPaid: amt,
+        PaymentMethod: document.getElementById('pay-method').value,
+        Note: document.getElementById('pay-note').value.trim(),
+        CreatedBy: 'Admin'
+      });
+      closeModal();
+      showToast('บันทึกรับชำระหนี้เรียบร้อย!');
+      renderCredit();
+    } catch (e) {}
+  }
+
+  // ==========================================
+  // 📝 9. ADD MANUAL DEBT MODAL (เพิ่มลูกหนี้รายใหม่ / ยอดหนี้ยกมา)
+  // ==========================================
+  function openAddManualDebtModal() {
+    const custDatalist = (STATE.credit.customers || []).map(c => `<option value="${c.CustomerID} : ${escStr(c.CustomerName)}">`).join('');
+    const rOpts = (STATE.credit.routes || []).map(r => `<option value="${r.RouteID}">${r.RouteName}</option>`).join('');
+    const todayISO = new Date().toISOString().slice(0, 10);
+
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-4">
+        <h3 class="font-extrabold text-lg text-slate-800 flex items-center gap-2">
+          <i data-lucide="file-plus" class="w-5 h-5 text-amber-500"></i> เพิ่มรายการลูกหนี้ / บันทึกยอดหนี้ยกมา
+        </h3>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <div>
+          <label class="text-xs font-bold text-slate-600">เลือกร้านค้าเดิม หรือ พิมพ์ชื่อร้านลูกหนี้ใหม่ *</label>
+          <input list="ar-cust-dl" id="ar-cust-input" class="w-full mt-1 p-2.5 border-2 border-amber-300 rounded-xl font-bold text-slate-800 outline-none" placeholder="ค้นหาร้านเดิม หรือ พิมพ์ชื่อร้านใหม่ได้เลย...">
+          <datalist id="ar-cust-dl">${custDatalist}</datalist>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">สายส่งที่รับผิดชอบ</label>
+            <select id="ar-route" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold text-slate-700">
+              <option value="หน้าลาน">🏠 หน้าลาน (หน้าร้าน)</option>
+              ${rOpts}
+            </select>
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">วันที่เกิดยอดหนี้</label>
+            <input type="date" id="ar-date" value="${todayISO}" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold">
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-extrabold text-rose-600">จำนวนเงินค้างชำระ (บาท) *</label>
+            <input type="number" id="ar-amount" class="w-full mt-1 p-2.5 border-2 border-rose-300 rounded-xl font-black text-lg text-rose-600 text-right" placeholder="0">
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">รายละเอียดบิล</label>
+            <input type="text" id="ar-desc" value="ยอดหนี้ค้างชำระยกมา" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-semibold text-xs">
+          </div>
+        </div>
+
+        <div class="flex justify-end gap-2 pt-2">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="saveManualDebtModal()" class="px-6 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-extrabold shadow-md text-xs">บันทึกตั้งหนี้</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  }
+
+  async function saveManualDebtModal() {
+    const rawVal = document.getElementById('ar-cust-input').value.trim();
+    const amt = parseFloat(document.getElementById('ar-amount').value) || 0;
+    if (!rawVal) return showToast('กรุณาระบุชื่อร้านลูกหนี้', 'error');
+    if (amt <= 0) return showToast('กรุณาระบุจำนวนเงินค้างชำระ', 'error');
+
+    let cid = '', cname = rawVal;
+    if (rawVal.includes(' : ')) {
+      const parts = rawVal.split(' : ');
+      cid = parts[0].trim();
+      cname = parts[1].trim();
+    }
+
+    try {
+      await apiCall('addManualCreditBill', {
+        CustomerID: cid,
+        CustomerName: cname,
+        RouteID: document.getElementById('ar-route').value,
+        BillDate: document.getElementById('ar-date').value,
+        Amount: amt,
+        Description: document.getElementById('ar-desc').value.trim()
+      });
+      closeModal();
+      showToast('บันทึกยอดลูกหนี้สำเร็จ!');
+      renderCredit();
+    } catch (e) {}
+  }
+
+  // ==========================================
+  // 📦 10. INVENTORY MODAL (ผลิตเข้าคลัง / เบิกหลอดใหญ่ไปบด / ปรับปรุงสต๊อก)
+  // ==========================================
+  window.INV_MODAL_TAB = 'PROD';
+
+  function openInventoryModal(defaultTab = 'PROD') {
+    window.INV_MODAL_TAB = defaultTab;
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-3">
+        <h3 class="font-extrabold text-lg text-slate-800 flex items-center gap-2">
+          <i data-lucide="boxes" class="w-5 h-5 text-blue-600"></i> จัดการสต๊อกห้องเย็น & แปรรูปน้ำแข็งบด
+        </h3>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <div class="grid grid-cols-3 gap-1.5 bg-slate-100 p-1 rounded-xl">
+          <button id="inv-tab-prod" onclick="switchInvModalTab('PROD')" class="py-2 rounded-lg font-extrabold text-xs">➕ ผลิตเข้าคลัง</button>
+          <button id="inv-tab-crush" onclick="switchInvModalTab('CRUSH')" class="py-2 rounded-lg font-extrabold text-xs">⚙️ เบิกหลอดใหญ่ไปบด</button>
+          <button id="inv-tab-adj" onclick="switchInvModalTab('ADJ')" class="py-2 rounded-lg font-extrabold text-xs">🔧 โอน/ปรับสต๊อก</button>
+        </div>
+
+        <div id="inv-modal-body" class="space-y-3"></div>
+
+        <div class="flex justify-end gap-2 pt-2 border-t border-slate-100">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="saveInventoryModal()" class="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-extrabold shadow-md text-xs">บันทึกรายการสต๊อก</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+    switchInvModalTab(defaultTab);
+  }
+
+  function switchInvModalTab(tab) {
+    window.INV_MODAL_TAB = tab;
+    const prods = STATE.inventory.products || [];
+    ['prod', 'crush', 'adj'].forEach(t => {
+      const btn = document.getElementById('inv-tab-' + t);
+      if (btn) btn.className = (t.toUpperCase() === tab) ? 'py-2 rounded-lg font-extrabold text-xs bg-blue-600 text-white shadow-xs' : 'py-2 rounded-lg font-extrabold text-xs text-slate-600';
+    });
+
+    const body = document.getElementById('inv-modal-body');
+    if (tab === 'PROD') {
+      const rows = prods.map(p => `
+        <div class="flex items-center justify-between p-2.5 bg-emerald-50/50 border border-emerald-200 rounded-xl">
+          <span class="font-bold text-xs text-slate-800">${p.ProductName} (${p.Unit})</span>
+          <input type="number" class="inv-prod-qty w-24 p-2 bg-white border-2 border-emerald-400 rounded-xl text-center font-black text-emerald-700 text-sm" data-id="${p.ProductID}" data-name="${escStr(p.ProductName)}" placeholder="0" min="0">
+        </div>
+      `).join('');
+      body.innerHTML = `<p class="text-xs text-slate-500">ระบุจำนวนน้ำแข็งที่ผลิตเสร็จเข้าห้องเย็นในกะนี้:</p><div class="space-y-1.5">${rows}</div><input type="text" id="inv-note" class="w-full p-2.5 border border-slate-200 rounded-xl text-xs" placeholder="หมายเหตุกะผลิต...">`;
+    } else if (tab === 'CRUSH') {
+      const pOpts = prods.map(p => `<option value="${p.ProductID}" data-name="${escStr(p.ProductName)}">${p.ProductName}</option>`).join('');
+      body.innerHTML = `
+        <div class="bg-amber-50 p-3 rounded-xl border border-amber-200 space-y-2">
+          <label class="text-xs font-extrabold text-amber-900">1. ต้นทาง: เบิกน้ำแข็งออกไปบด (ตัดสต๊อก OUT)</label>
+          <div class="grid grid-cols-2 gap-2">
+            <select id="crush-from-id" class="p-2.5 bg-white border rounded-xl font-bold text-xs">${pOpts}</select>
+            <input type="number" id="crush-from-qty" oninput="document.getElementById('crush-to-qty').value=this.value" class="p-2.5 bg-white border-2 border-amber-400 rounded-xl text-center font-black text-amber-800" placeholder="จำนวนที่เบิกไปบด">
+          </div>
+        </div>
+        <div class="bg-blue-50 p-3 rounded-xl border border-blue-200 space-y-2">
+          <label class="text-xs font-extrabold text-blue-900">2. ปลายทาง: รับเข้าเป็นน้ำแข็งบด (เพิ่มสต๊อก IN)</label>
+          <div class="grid grid-cols-2 gap-2">
+            <select id="crush-to-id" class="p-2.5 bg-white border rounded-xl font-bold text-xs">${pOpts}</select>
+            <input type="number" id="crush-to-qty" class="p-2.5 bg-white border-2 border-blue-400 rounded-xl text-center font-black text-blue-800" placeholder="จำนวนน้ำแข็งบดที่ได้">
+          </div>
+        </div>
+        <input type="text" id="inv-note" class="w-full p-2.5 border border-slate-200 rounded-xl text-xs" placeholder="หมายเหตุการบดน้ำแข็ง...">
+      `;
+      const toSel = document.getElementById('crush-to-id');
+      if (toSel) {
+        Array.from(toSel.options).forEach((opt, idx) => { if (opt.text.includes('บด')) toSel.selectedIndex = idx; });
+      }
+    } else {
+      const pOpts = prods.map(p => `<option value="${p.ProductID}" data-name="${escStr(p.ProductName)}">${p.ProductName}</option>`).join('');
+      body.innerHTML = `
+        <div class="grid grid-cols-2 gap-2">
+          <div><label class="text-xs font-bold">ประเภทรายการ</label><select id="adj-flow" class="w-full mt-1 p-2.5 border rounded-xl font-bold text-xs"><option value="OUT">📤 จ่ายออก / โอนออก / ละลายทิ้ง (-)</option><option value="IN">📥 รับโอนเข้า / ปรับเพิ่มสต๊อก (+)</option></select></div>
+          <div><label class="text-xs font-bold">เลือกสินค้า</label><select id="adj-prod" class="w-full mt-1 p-2.5 border rounded-xl font-bold text-xs">${pOpts}</select></div>
+        </div>
+        <div><label class="text-xs font-bold">จำนวนหน่วย *</label><input type="number" id="adj-qty" class="w-full mt-1 p-2.5 border-2 border-blue-300 rounded-xl text-center font-black text-lg" placeholder="0"></div>
+        <input type="text" id="inv-note" class="w-full p-2.5 border border-slate-200 rounded-xl text-xs" placeholder="ระบุสาเหตุการปรับสต๊อก / สาขาที่โอน...">
+      `;
+    }
+  }
+
+  async function saveInventoryModal() {
+    const tab = window.INV_MODAL_TAB;
+    const note = document.getElementById('inv-note')?.value.trim() || '';
+    const items = [];
+
+    if (tab === 'PROD') {
+      document.querySelectorAll('.inv-prod-qty').forEach(inp => {
+        const q = parseFloat(inp.value) || 0;
+        if (q > 0) items.push({ id: inp.getAttribute('data-id'), name: inp.getAttribute('data-name'), qty: q, flow: 'IN', actionType: 'ผลิตเข้าคลัง', note: note });
+      });
+    } else if (tab === 'CRUSH') {
+      const fSel = document.getElementById('crush-from-id');
+      const tSel = document.getElementById('crush-to-id');
+      const fQty = parseFloat(document.getElementById('crush-from-qty').value) || 0;
+      const tQty = parseFloat(document.getElementById('crush-to-qty').value) || 0;
+      if (fQty <= 0 || tQty <= 0) return showToast('กรุณาระบุจำนวนที่เบิกไปบดและจำนวนที่ได้', 'error');
+      items.push({ id: fSel.value, name: fSel.options[fSel.selectedIndex].getAttribute('data-name'), qty: fQty, flow: 'OUT', actionType: 'เบิกไปบด', note: note });
+      items.push({ id: tSel.value, name: tSel.options[tSel.selectedIndex].getAttribute('data-name'), qty: tQty, flow: 'IN', actionType: 'รับเข้าจากบด', note: note });
+    } else {
+      const pSel = document.getElementById('adj-prod');
+      const q = parseFloat(document.getElementById('adj-qty').value) || 0;
+      const flow = document.getElementById('adj-flow').value;
+      if (q <= 0) return showToast('กรุณาระบุจำนวนสินค้า', 'error');
+      items.push({ id: pSel.value, name: pSel.options[pSel.selectedIndex].getAttribute('data-name'), qty: q, flow: flow, actionType: flow === 'IN' ? 'ปรับเพิ่มสต๊อก/รับโอน' : 'ตัดปรับสต๊อก/โอนออก', note: note });
+    }
+
+    if (items.length === 0) return showToast('กรุณาระบุจำนวนสินค้าอย่างน้อย 1 รายการ', 'error');
+
+    try {
+      await apiCall('saveInventoryTransaction', { items: items, CreatedBy: 'Admin' });
+      closeModal();
+      showToast('บันทึกความเคลื่อนไหวสต๊อกเรียบร้อย!');
+      renderInventory();
+    } catch (e) {}
+  }
+
+  // ==========================================
+  // ⚙️ 11. DYNAMIC MASTER MODAL (ฐานข้อมูลหลัก)
+  // ==========================================
+  function openMasterModalById(pkVal = '') {
+    const tbl = STATE.master.tableName;
+    const cfg = MASTER_CFG[tbl];
+    if (!cfg) return;
+
+    const item = pkVal ? (STATE.master.list || []).find(x => String(x[cfg.pk]) === String(pkVal)) : null;
+    const fieldInputs = cfg.fields.map(f => `
+      <div>
+        <label class="text-xs font-bold text-slate-600">${f.l}</label>
+        <input type="text" class="mst-field-input w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold text-slate-800 outline-none focus:border-blue-500" data-key="${f.k}" value="${item ? escStr(item[f.k] || '') : ''}">
+      </div>
+    `).join('');
+
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-4">
+        <h3 class="font-extrabold text-lg text-slate-800">${item ? 'แก้ไข ' + cfg.title + ' (' + pkVal + ')' : 'เพิ่ม ' + cfg.title}</h3>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <input type="hidden" id="mst-pk-val" value="${item ? escStr(pkVal) : ''}">
+        ${fieldInputs}
+        ${item ? `
+          <div>
+            <label class="text-xs font-bold text-slate-600">สถานะ</label>
+            <select id="mst-status" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold">
+              <option value="Active" ${item.Status !== 'Inactive' ? 'selected' : ''}>🟢 Active (ใช้งาน)</option>
+              <option value="Inactive" ${item.Status === 'Inactive' ? 'selected' : ''}>🔴 Inactive (ระงับ)</option>
+            </select>
+          </div>
+        ` : ''}
+        <div class="flex justify-end gap-2 pt-3">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="saveMasterModal()" class="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-extrabold shadow-md text-xs">บันทึกข้อมูล</button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  }
+
+  async function saveMasterModal() {
+    const tbl = STATE.master.tableName;
+    const cfg = MASTER_CFG[tbl];
+    const record = {};
+    const pkVal = document.getElementById('mst-pk-val').value;
+    if (pkVal) record[cfg.pk] = pkVal;
+
+    document.querySelectorAll('.mst-field-input').forEach(inp => {
+      record[inp.getAttribute('data-key')] = inp.value.trim();
+    });
+    if (document.getElementById('mst-status')) {
+      record['Status'] = document.getElementById('mst-status').value;
+    }
+
+    try {
+      await apiCall('saveMasterData', { tableName: tbl, record: record });
+      closeModal();
+      showToast('บันทึกข้อมูลสำเร็จ!');
+      navigateMaster(tbl);
+    } catch (e) {}
+  }
+  // ==========================================
+  // 💰 12. EXPENSE & OTHER INCOME MODAL (บันทึกรายจ่ายโรงงาน / เบิกเงินล่วงหน้า / รายรับอื่น)
+  // ==========================================
+  function openExpenseModal(txType = 'EXPENSE') {
+    const isIncome = (txType === 'OTHER_INCOME');
+    const d = (window.EXPENSE_STATE && window.EXPENSE_STATE.data) ? window.EXPENSE_STATE.data : {};
+    const empList = d.employees || (STATE.route ? STATE.route.employees : []) || [];
+    const vehList = d.vehicles || (STATE.route ? STATE.route.vehicles : []) || [];
+
+    const refSuggestions = [
+      ...empList.map(e => `<option value="พนักงาน: ${escStr(e.EmpName)}">`),
+      ...vehList.map(v => `<option value="รถ: ${escStr(v.LicensePlate)}">`)
+    ].join('');
+
+    const categoryOpts = isIncome
+      ? `
+        <option value="💰 รายรับขายกระสอบเก่า / ถังชำรุด">💰 รายรับขายกระสอบเก่า / ถังชำรุด</option>
+        <option value="💰 เงินมัดจำถังน้ำแข็ง / ค่าเช่าถัง">💰 เงินมัดจำถังน้ำแข็ง / ค่าเช่าถัง</option>
+        <option value="💰 รายรับเบ็ดเตล็ดอื่นๆ">💰 รายรับเบ็ดเตล็ดอื่นๆ</option>
+      `
+      : `
+        <option value="⚡ ค่าไฟฟ้า (PEA)">⚡ ค่าไฟฟ้า (PEA)</option>
+        <option value="🛍️ ค่ากระสอบ / ถุง / เชือก">🛍️ ค่ากระสอบ / ถุง / เชือก</option>
+        <option value="💸 พนักงานเบิกเงินล่วงหน้า">💸 พนักงานเบิกเงินล่วงหน้า (หักสิ้นเดือน)</option>
+        <option value="👷 ค่าแรง / เงินเดือน / OT">👷 ค่าแรง / เงินเดือน / OT</option>
+        <option value="🔧 ซ่อมบำรุงเครื่องจักร / ห้องเย็น">🔧 ซ่อมบำรุงเครื่องจักร / ห้องเย็น</option>
+        <option value="🚚 ซ่อมบำรุงรถสายส่ง / ยาง / น้ำมันเครื่อง">🚚 ซ่อมบำรุงรถสายส่ง / ยาง / น้ำมันเครื่อง</option>
+        <option value="💧 ค่าน้ำดิบ / สารกรอง / เกลือ / คลอรีน">💧 ค่าน้ำดิบ / สารกรอง / เกลือ / คลอรีน</option>
+        <option value="🍱 ค่าอาหาร / น้ำดื่ม / สวัสดิการ">🍱 ค่าอาหาร / น้ำดื่ม / สวัสดิการ</option>
+        <option value="🏢 ค่าใช้จ่ายบริหาร / เบ็ดเตล็ดหน้าลาน">🏢 ค่าใช้จ่ายบริหาร / เบ็ดเตล็ดหน้าลาน</option>
+      `;
+
+    const todayISO = new Date().toISOString().slice(0, 10);
+
+    const html = `
+      <div class="flex justify-between items-center pb-3 border-b border-slate-200 mb-4">
+        <h3 class="font-extrabold text-lg ${isIncome ? 'text-emerald-700' : 'text-rose-600'} flex items-center gap-2">
+          <i data-lucide="${isIncome ? 'plus-circle' : 'minus-circle'}" class="w-5 h-5"></i>
+          ${isIncome ? 'บันทึกรายรับอื่นๆ (นอกเหนือจากการขายน้ำแข็ง)' : 'บันทึกรายจ่ายโรงงาน / พนักงานเบิกล่วงหน้า'}
+        </h3>
+        <button onclick="closeModal()" class="p-1.5 text-slate-400 hover:bg-slate-100 rounded-lg"><i data-lucide="x" class="w-5 h-5"></i></button>
+      </div>
+
+      <div class="space-y-3.5 text-sm">
+        <input type="hidden" id="m-exp-type" value="${txType}">
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">หมวดหมู่รายการ *</label>
+            <select id="m-exp-cat" class="w-full mt-1 p-2.5 border-2 border-slate-200 rounded-xl font-extrabold text-slate-800 text-xs outline-none focus:border-blue-500">
+              ${categoryOpts}
+            </select>
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">วันที่เกิดรายการ *</label>
+            <input type="date" id="m-exp-date" value="${todayISO}" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl font-bold text-xs">
+          </div>
+        </div>
+
+        <div>
+          <label class="text-xs font-bold text-slate-600">รายละเอียดรายการ *</label>
+          <input type="text" id="m-exp-title" class="w-full mt-1 p-2.5 border-2 border-slate-300 rounded-xl font-bold text-slate-800 outline-none focus:border-blue-600" placeholder="${isIncome ? 'เช่น ขายกระสอบเก่า 50 ใบ...' : 'เช่น จ่ายค่าไฟเดือน ต.ค., ปะยางรถสาย A, เบิกเงินล่วงหน้า...'}">
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-extrabold ${isIncome ? 'text-emerald-700' : 'text-rose-600'}">จำนวนเงิน (บาท) *</label>
+            <input type="number" id="m-exp-amt" class="w-full mt-1 p-2.5 border-2 ${isIncome ? 'border-emerald-400 text-emerald-700' : 'border-rose-400 text-rose-600'} rounded-xl font-black text-xl text-right outline-none" placeholder="0">
+          </div>
+          <div>
+            <label class="text-xs font-extrabold text-slate-700">กระเป๋าเงินที่จ่าย/รับ *</label>
+            <select id="m-exp-channel" class="w-full mt-1 p-2.5 border-2 border-amber-300 bg-amber-50/40 rounded-xl font-extrabold text-slate-800 text-xs outline-none">
+              <option value="เงินสดหน้าลาน (ลิ้นชัก)">🗄️ เงินสดหน้าลาน (หัก/เพิ่มลิ้นชักเสมียน)</option>
+              <option value="โอนจากบัญชีธนาคาร">📱 โอนผ่านบัญชีธนาคาร (ไม่กระทบลิ้นชัก)</option>
+              <option value="เงินสดเซฟผู้บริหาร">🔒 เงินสดเซฟผู้บริหาร (เถ้าแก่จ่ายเอง)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-bold text-slate-600">ผูกชื่อพนักงาน / ทะเบียนรถ (ถ้ามี)</label>
+            <input list="exp-ref-dl" id="m-exp-ref" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl text-xs font-bold" placeholder="เลือกชื่อคนเบิก หรือ ทะเบียนรถที่ซ่อม...">
+            <datalist id="exp-ref-dl">${refSuggestions}</datalist>
+          </div>
+          <div>
+            <label class="text-xs font-bold text-slate-600">เลขที่ใบเสร็จ / หมายเหตุ</label>
+            <input type="text" id="m-exp-note" class="w-full mt-1 p-2.5 border border-slate-200 rounded-xl text-xs" placeholder="หมายเหตุเพิ่มเติม...">
+          </div>
+        </div>
+
+        <div class="flex justify-end gap-2 pt-3 border-t border-slate-100">
+          <button onclick="closeModal()" class="px-4 py-2.5 bg-slate-100 rounded-xl font-bold text-slate-600 text-xs">ยกเลิก</button>
+          <button onclick="submitExpenseModal()" class="px-6 py-2.5 ${isIncome ? 'bg-emerald-600 hover:bg-emerald-700' : 'bg-rose-600 hover:bg-rose-700'} text-white rounded-xl font-extrabold shadow-md text-xs flex items-center gap-1.5">
+            <i data-lucide="save" class="w-4 h-4"></i> ยืนยันบันทึกรายการ
+          </button>
+        </div>
+      </div>
+    `;
+    openModal(html);
+  }
+
+  async function submitExpenseModal() {
+    const title = document.getElementById('m-exp-title')?.value.trim() || '';
+    const amt = parseFloat(document.getElementById('m-exp-amt')?.value) || 0;
+    if (!title) return showToast('กรุณาระบุรายละเอียดรายการ', 'error');
+    if (amt <= 0) return showToast('กรุณาระบุจำนวนเงินให้มากกว่า 0 บาท', 'error');
+
+    const payload = {
+      TxType: document.getElementById('m-exp-type').value,
+      Category: document.getElementById('m-exp-cat').value,
+      ExpDate: document.getElementById('m-exp-date').value,
+      Title: title,
+      Amount: amt,
+      PayChannel: document.getElementById('m-exp-channel').value,
+      RefTarget: document.getElementById('m-exp-ref')?.value.trim() || '',
+      Note: document.getElementById('m-exp-note')?.value.trim() || ''
+    };
+
+    try {
+      await apiCall('saveExpense', payload);
+      closeModal();
+      showToast('บันทึกรายการสำเร็จ!');
+      fetchExpenseDashboardData();
+    } catch (e) {}
+  }
+</script>

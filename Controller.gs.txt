@@ -1,0 +1,3029 @@
+/**
+ * ============================================================================
+ * 🏢 MAE JAI SMART ERP - MASTER BACKEND CONTROLLER (Controller.gs)
+ * Version: 4.8 (Enterprise Production Release - Shift Lock Guard & Full Audit)
+ * ⚠️ หมายเหตุ: วางโค้ดไฟล์นี้ใน "Controller.gs" เท่านั้น
+ * ----------------------------------------------------------------------------
+ * โครงสร้างโมดูลภายในไฟล์นี้:
+ *   - CORE HELPER: Concurrency Lock, SKU Validator & Shift Guard (ป้องกันข้อมูลชนกัน & ล็อกหลังปิดกะ)
+ *   - MODULE 1: EXECUTIVE DASHBOARD (สรุปภาพรวมรายวัน, แยกตามสายส่ง, หนี้, น้ำมัน, ระยะทาง)
+ *   - MODULE 2: SMART POS & SALES ENGINE (ออกบิลหน้าโรงงาน/สายส่ง, โปร 3/100, ขายปลีกไม่หักสต๊อก, ยกเลิกบิล)
+ *   - MODULE 3: CUSTOMER & PROMOTION ENGINE (ทะเบียนลูกค้า, ราคาพิเศษ, โปรคละ 3 ชิ้น 100)
+ *   - MODULE 4: DYNAMIC MASTER DATA (สินค้า, สายส่ง, รถขนส่ง, พนักงาน & PIN, โปรโมชั่น)
+ *   - MODULE 5: SMART BUCKET TRACKING (ระบบยืม-คืนถังน้ำแข็งรายใบ Single-Source Serial)
+ *   - MODULE 6: ROUTE DISPATCH, RELOAD, SETTLEMENT & FUEL (ปล่อยรถกันซ้ำ, เบิกเพิ่ม, ปิดกะคืนสต๊อก)
+ *   - MODULE 7: CREDIT & AR COLLECTION (ระบบลูกหนี้, ตั้งหนี้รายใหม่/ยอดยกมา, รับชำระหนี้)
+ *   - MODULE 8: INVENTORY MANAGEMENT (ผลิตเข้าคลัง, เบิกหลอดใหญ่มาบด, โอนระหว่างสาขา)
+ *   - MODULE 9: BUCKET MASTER REGISTRY (ทะเบียนสินทรัพย์ถังน้ำแข็ง 11 คอลัมน์)
+ *   - MODULE 10: DRIVER MOBILE PORTAL (V4.8 ล็อกสายส่งแม่นยำ, ล้างหน้าจอทันทีเมื่อปิดกะ, โอนน้ำแข็ง, ไมล์)
+ *   - MODULE 11: HISTORICAL BUSINESS REPORTS & AUDIT ENGINE (รายงานย้อนหลัง 4 มิติ & กรองข้อมูล)
+ * ============================================================================
+ */
+
+// ==========================================
+// 🛡️ CORE HELPER: ระบบป้องกันข้อมูลชนกัน (LockService), ตัวกรองสต๊อก & ตัวล็อกกะสายส่ง
+// ==========================================
+function isStockProductId_(pid) {
+  var id = String(pid || '').trim();
+  if (!id) return false;
+  if (id === 'FEE' || id === 'DISCOUNT' || id === 'AR-MANUAL') return false;
+  if (id.indexOf('RET-') === 0) return false; // ขายปลีกตักแบ่ง 10/20 บาท ไม่นับเป็นกระสอบตัดสต๊อก
+  return true;
+}
+
+function withSheetLock_(fn) {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(15000); // รอคิวสูงสุด 15 วินาที ป้องกันคนขับและเสมียนกดบันทึกชนกัน
+  try {
+    return fn();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * ตรวจสอบว่าสายส่งยังมีกะที่ "กำลังวิ่งส่ง" อยู่หรือไม่ (ป้องกันคนขับกดส่งบิลหลังจากเสมียนปิดกะไปแล้ว)
+ */
+function assertRouteShiftActive_(routeId, createdBy) {
+  var rId = String(routeId || '').trim();
+  var by = String(createdBy || '').trim();
+  var isDriverAction = (by.indexOf('คนขับ') !== -1 || by === 'Driver');
+  if (!isDriverAction) return; // ถ้าเสมียนคีย์หน้าลานหรือคีย์แทนจากออฟฟิศ อนุญาตตามปกติ
+
+  var dspHeaders = ['DispatchID', 'DispatchDate', 'RouteID', 'RouteName', 'VehicleID', 'DriverName', 'StartMileage', 'EndMileage', 'LoadedQty', 'SoldQty', 'ReturnedQty', 'LossQty', 'CashSales', 'TransferSales', 'CreditSales', 'FuelExpense', 'OtherExpense', 'ExpectedCash', 'ActualCash', 'CashDiff', 'Status', 'Note', 'LoadDetails'];
+  var dispatches = getSheetDataAsObjects('tb_RouteDispatches', dspHeaders);
+  var hasActive = dispatches.some(function(d) {
+    if (String(d.Status || '').trim() !== 'กำลังวิ่งส่ง') return false;
+    return String(d.RouteID || '').trim() === rId || String(d.RouteName || '').trim() === rId;
+  });
+
+  if (!hasActive) {
+    throw new Error('เสมียนหน้าลานได้ทำการ "ปิดกะ" สายส่งนี้ไปแล้ว ไม่สามารถบันทึกหรือแก้ไขบิลเพิ่มได้ค่ะ (กรุณากดซิงค์ข้อมูล)');
+  }
+}
+
+// ==========================================
+// 📊 MODULE 1: EXECUTIVE DASHBOARD (ครบทั้งยอดขาย, เก็บหนี้, ค่าน้ำมัน และระยะทางรายสาย)
+// ==========================================
+function api_getDashboardData() {
+  var salesHeaders = ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy'];
+  var detailHeaders = ['DetailID', 'SaleID', 'ProductID', 'ProductName', 'Quantity', 'UnitPrice', 'SubTotal'];
+  var custHeaders = ['CustomerID', 'CustomerName', 'Phone', 'CustomerType', 'RouteID', 'CreditLimit', 'Status', 'CreatedAt'];
+  var routeHeaders = ['RouteID', 'RouteName', 'Description', 'Status', 'CreatedAt'];
+  var payHeaders = ['PaymentID', 'PaymentDate', 'CustomerID', 'CustomerName', 'RefSaleIDs', 'AmountPaid', 'PaymentMethod', 'CreatedBy', 'Note'];
+  var dspHeaders = ['DispatchID', 'DispatchDate', 'RouteID', 'RouteName', 'VehicleID', 'DriverName', 'StartMileage', 'EndMileage', 'LoadedQty', 'SoldQty', 'ReturnedQty', 'LossQty', 'CashSales', 'TransferSales', 'CreditSales', 'FuelExpense', 'OtherExpense', 'ExpectedCash', 'ActualCash', 'CashDiff', 'Status', 'Note', 'LoadDetails'];
+  var fuelHeaders = ['FuelID', 'FuelDate', 'VehicleID', 'DriverName', 'Mileage', 'Liters', 'TotalCost', 'PaidBy', 'Note'];
+
+  var sales = getSheetDataAsObjects('tb_Sales', salesHeaders);
+  var saleDetails = getSheetDataAsObjects('tb_SalesDetails', detailHeaders);
+  var customers = getSheetDataAsObjects('tb_Customers', custHeaders);
+  var routes = getSheetDataAsObjects('tb_Routes', routeHeaders);
+  var payments = getSheetDataAsObjects('tb_Payments', payHeaders);
+  var dispatches = getSheetDataAsObjects('tb_RouteDispatches', dspHeaders);
+  var fuelLogs = getSheetDataAsObjects('tb_FuelLogs', fuelHeaders);
+
+  var todayStr = Utilities.formatDate(new Date(), 'GMT+7', 'yyyy-MM-dd');
+  var todayDisplay = Utilities.formatDate(new Date(), 'GMT+7', 'dd/MM/yyyy');
+
+  var routeNameMap = { 'หน้าลาน': '🏠 หน้าลาน (หน้าร้าน)', 'หน้าร้าน': '🏠 หน้าลาน (หน้าร้าน)', 'WALK-IN': '🏠 หน้าลาน (หน้าร้าน)' };
+  routes.forEach(function(r) {
+    var rId = String(r.RouteID || '').trim();
+    var rName = String(r.RouteName || '').trim();
+    if (rId) routeNameMap[rId] = rName || rId;
+    if (rName) routeNameMap[rName] = rName;
+  });
+
+  var custRouteMap = {};
+  customers.forEach(function(c) {
+    custRouteMap[String(c.CustomerID).trim()] = String(c.RouteID || 'หน้าลาน').trim();
+  });
+
+  var todaySaleIds = {};
+  var rawTodaySales = [];
+  for (var i = 0; i < sales.length; i++) {
+    var s = sales[i];
+    if (String(s.SaleDate || '').indexOf(todayStr) === 0 && String(s.SaleID || '').indexOf('AR-') === -1) {
+      rawTodaySales.push(s);
+      todaySaleIds[s.SaleID] = true;
+    }
+  }
+
+  var qtyBySaleId = {};
+  var summaryBySaleId = {};
+  for (var j = 0; j < saleDetails.length; j++) {
+    var d = saleDetails[j];
+    if (!todaySaleIds[d.SaleID]) continue;
+    var q = parseFloat(d.Quantity) || 0;
+    if (isStockProductId_(d.ProductID)) {
+      qtyBySaleId[d.SaleID] = (qtyBySaleId[d.SaleID] || 0) + q;
+    }
+    if (!summaryBySaleId[d.SaleID]) summaryBySaleId[d.SaleID] = [];
+    summaryBySaleId[d.SaleID].push(d.ProductName + (q > 1 ? ' x' + q : ''));
+  }
+
+  var routeStatsMap = {
+    'หน้าลาน': { RouteKey: 'หน้าลาน', RouteName: '🏠 หน้าลาน (หน้าร้าน)', billCount: 0, totalQty: 0, cashSales: 0, transferSales: 0, creditSales: 0, totalSales: 0, debtCollectedCash: 0, debtCollectedTransfer: 0, debtCollectedTotal: 0, fuelCost: 0, fuelCashCost: 0, mileageDist: 0 }
+  };
+  routes.forEach(function(r) {
+    var rKey = String(r.RouteID || '').trim();
+    if (rKey && r.Status !== 'Inactive') {
+      routeStatsMap[rKey] = {
+        RouteKey: rKey, RouteName: '🚚 ' + (r.RouteName || rKey),
+        billCount: 0, totalQty: 0, cashSales: 0, transferSales: 0, creditSales: 0, totalSales: 0,
+        debtCollectedCash: 0, debtCollectedTransfer: 0, debtCollectedTotal: 0, fuelCost: 0, fuelCashCost: 0, mileageDist: 0
+      };
+    }
+  });
+
+  function resolveRouteKey_(rawRouteId, custId) {
+    var rId = String(rawRouteId || '').trim();
+    if (!rId || rId === 'หน้าลาน' || rId === 'หน้าร้าน' || rId === 'หน้าโรง' || rId === 'หน้าโรงงาน' || rId === 'WALK-IN') {
+      return 'หน้าลาน';
+    }
+    if (routeStatsMap[rId]) return rId;
+    for (var k in routeStatsMap) {
+      if (routeStatsMap[k].RouteName.indexOf(rId) !== -1 || k === rId) return k;
+    }
+    routeStatsMap[rId] = {
+      RouteKey: rId, RouteName: '🚚 ' + (routeNameMap[rId] || rId),
+      billCount: 0, totalQty: 0, cashSales: 0, transferSales: 0, creditSales: 0, totalSales: 0,
+      debtCollectedCash: 0, debtCollectedTransfer: 0, debtCollectedTotal: 0, fuelCost: 0, fuelCashCost: 0, mileageDist: 0
+    };
+    return rId;
+  }
+
+  var todaySales = 0, cashSales = 0, transferSales = 0, creditSales = 0, todayBills = 0, totalIceQty = 0;
+
+  rawTodaySales.forEach(function(s) {
+    var isCancelled = (s.PaymentStatus === 'Cancelled' || s.PaymentStatus === 'ยกเลิก');
+    var resolvedKey = resolveRouteKey_(s.RouteID, s.CustomerID);
+    var rBucket = routeStatsMap[resolvedKey];
+
+    s.RouteID = resolvedKey;
+    s.RouteName = rBucket.RouteName;
+    s.ItemSummary = (summaryBySaleId[s.SaleID] || []).join(', ') || '-';
+    s.TotalQty = qtyBySaleId[s.SaleID] || 0;
+
+    if (!isCancelled) {
+      var amt = parseFloat(s.TotalAmount) || 0;
+      var q = s.TotalQty;
+      var pType = String(s.PaymentType || '');
+
+      todaySales += amt; todayBills++; totalIceQty += q;
+      rBucket.billCount++; rBucket.totalQty += q; rBucket.totalSales += amt;
+
+      if (pType.indexOf('เครดิต') !== -1 || pType.indexOf('บิลเชื่อ') !== -1 || pType.indexOf('ค้างชำระ') !== -1) {
+        creditSales += amt; rBucket.creditSales += amt;
+      } else if (pType.indexOf('โอน') !== -1) {
+        transferSales += amt; rBucket.transferSales += amt;
+      } else {
+        cashSales += amt; rBucket.cashSales += amt;
+      }
+    }
+  });
+
+  var driverToRouteMap = {};
+  var vehicleToRouteMap = {};
+
+  dispatches.forEach(function(dsp) {
+    var rKey = resolveRouteKey_(dsp.RouteID || dsp.RouteName, '');
+    var drv = String(dsp.DriverName || '').trim();
+    var veh = String(dsp.VehicleID || '').trim();
+    if (drv) driverToRouteMap[drv] = rKey;
+    if (veh) vehicleToRouteMap[veh] = rKey;
+
+    if (String(dsp.DispatchDate || '').indexOf(todayStr) === 0 && routeStatsMap[rKey]) {
+      var startM = parseFloat(dsp.StartMileage) || 0;
+      var endM = parseFloat(dsp.EndMileage) || 0;
+      if (startM > 0 && endM >= startM) {
+        routeStatsMap[rKey].mileageDist += (endM - startM);
+      }
+    }
+  });
+
+  var totalFuelExpense = 0;
+  var totalCashFuelExpense = 0;
+
+  fuelLogs.forEach(function(f) {
+    if (String(f.FuelDate || '').indexOf(todayStr) === 0) {
+      var fCost = parseFloat(f.TotalCost) || 0;
+      var paidBy = String(f.PaidBy || '');
+      var isCashFuel = (paidBy.indexOf('เงินสด') !== -1 || paidBy.indexOf('หัก') !== -1);
+
+      totalFuelExpense += fCost;
+      if (isCashFuel) totalCashFuelExpense += fCost;
+
+      var fDrv = String(f.DriverName || '').trim();
+      var fVeh = String(f.VehicleID || '').trim();
+      var matchedRouteKey = driverToRouteMap[fDrv] || vehicleToRouteMap[fVeh] || '';
+
+      if (!matchedRouteKey && fDrv) {
+        for (var dName in driverToRouteMap) {
+          if (dName.indexOf(fDrv) !== -1 || fDrv.indexOf(dName) !== -1) {
+            matchedRouteKey = driverToRouteMap[dName];
+            break;
+          }
+        }
+      }
+      if (!matchedRouteKey) matchedRouteKey = 'หน้าลาน';
+
+      var rBucket = routeStatsMap[matchedRouteKey] || routeStatsMap['หน้าลาน'];
+      if (rBucket) {
+        rBucket.fuelCost += fCost;
+        if (isCashFuel) rBucket.fuelCashCost += fCost;
+      }
+    }
+  });
+
+  var debtCollectedTotal = 0, debtCollectedCash = 0, debtCollectedTransfer = 0;
+  var todayPayments = [];
+
+  payments.forEach(function(p) {
+    if (String(p.PaymentDate || '').indexOf(todayStr) === 0) {
+      var pAmt = parseFloat(p.AmountPaid) || 0;
+      var method = String(p.PaymentMethod || 'เงินสด');
+      var cRoute = custRouteMap[String(p.CustomerID).trim()] || 'หน้าลาน';
+      var resolvedKey = (cRoute && cRoute !== 'หน้าลาน') ? resolveRouteKey_(cRoute, p.CustomerID) : 'หน้าลาน';
+      var rBucket = routeStatsMap[resolvedKey] || routeStatsMap['หน้าลาน'];
+
+      p.RouteName = rBucket.RouteName;
+      p.RouteKey = rBucket.RouteKey;
+      todayPayments.push(p);
+
+      debtCollectedTotal += pAmt;
+      rBucket.debtCollectedTotal += pAmt;
+
+      if (method.indexOf('โอน') !== -1) {
+        debtCollectedTransfer += pAmt; rBucket.debtCollectedTransfer += pAmt;
+      } else {
+        debtCollectedCash += pAmt; rBucket.debtCollectedCash += pAmt;
+      }
+    }
+  });
+
+  var routeBreakdown = Object.keys(routeStatsMap).map(function(k) { return routeStatsMap[k]; });
+  var activeCustomers = customers.filter(function(c) { return c.Status !== 'Inactive'; }).length;
+
+  return {
+    reportDate: todayDisplay,
+    todaySales: todaySales,
+    cashSales: cashSales,
+    transferSales: transferSales,
+    creditSales: creditSales,
+    todayBills: todayBills,
+    totalIceQty: totalIceQty,
+    debtCollectedTotal: debtCollectedTotal,
+    debtCollectedCash: debtCollectedCash,
+    debtCollectedTransfer: debtCollectedTransfer,
+    totalFuelExpense: totalFuelExpense,
+    totalCashFuelExpense: totalCashFuelExpense,
+    totalCashInHand: cashSales + debtCollectedCash - totalCashFuelExpense,
+    totalBankTransfer: transferSales + debtCollectedTransfer,
+    totalCustomers: activeCustomers,
+    routeBreakdown: routeBreakdown,
+    todayPayments: todayPayments.reverse(),
+    recentSales: rawTodaySales.reverse()
+  };
+}
+
+// ==========================================
+// 🛒 MODULE 2: SMART POS & SALES ENGINE (เฉพาะหน้าโรงงาน + โปร 3/100 + ขายปลีกไม่หักสต๊อก)
+// ==========================================
+function api_getInitialPOSData() {
+  var prodSheet = getOrCreateSheet('tb_Products', ['ProductID', 'ProductName', 'DefaultPrice', 'Unit', 'Status', 'CreatedAt']);
+  if (prodSheet.getLastRow() <= 1) {
+    var now = new Date();
+    prodSheet.getRange(2, 1, 4, 6).setValues([
+      ['P-0001', 'น้ำแข็งหลอดใหญ่', 35, 'กระสอบ', 'Active', now],
+      ['P-0002', 'น้ำแข็งหลอดเล็ก', 35, 'กระสอบ', 'Active', now],
+      ['P-0003', 'น้ำแข็งบด', 30, 'กระสอบ', 'Active', now],
+      ['P-0004', 'น้ำแข็งซอง', 50, 'ซอง', 'Active', now]
+    ]);
+  }
+
+  var routeSheet = getOrCreateSheet('tb_Routes', ['RouteID', 'RouteName', 'Description', 'Status', 'CreatedAt']);
+  if (routeSheet.getLastRow() <= 1) {
+    var nowRt = new Date();
+    routeSheet.getRange(2, 1, 2, 5).setValues([
+      ['RT-0001', 'สายส่ง A (แม่ใจ-เจริญราษฎร์)', 'วิ่งโซนตลาดและรอบนอก', 'Active', nowRt],
+      ['RT-0002', 'สายส่ง B (ศรีถ้อย-ป่าแฝก)', 'วิ่งโซนเหนือ', 'Active', nowRt]
+    ]);
+  }
+
+  var products = getSheetDataAsObjects('tb_Products', ['ProductID', 'ProductName', 'DefaultPrice', 'Unit', 'Status', 'CreatedAt']).filter(function(p) { return p.Status !== 'Inactive'; });
+  var customers = api_getCustomers();
+  var specialPrices = getSheetDataAsObjects('tb_SpecialPrices', ['SpPriceID', 'CustomerID', 'ProductID', 'SpecialPrice', 'Status', 'CreatedAt']).filter(function(s) { return s.Status !== 'Inactive'; });
+  var routes = getSheetDataAsObjects('tb_Routes', ['RouteID', 'RouteName', 'Description', 'Status', 'CreatedAt']).filter(function(r) { return r.Status !== 'Inactive'; });
+  var promoMap = getCustomerPromoMap_();
+
+  var invLogs = getSheetDataAsObjects('tb_InventoryLogs', ['InvLogID', 'LogDate', 'ProductID', 'ProductName', 'ActionType', 'QtyIn', 'QtyOut', 'Reference', 'CreatedBy', 'Note']);
+  var stockMap = {};
+  var prodUnitMap = {};
+  products.forEach(function(p) {
+    stockMap[p.ProductID] = 0;
+    prodUnitMap[p.ProductID] = p.Unit || 'กระสอบ';
+  });
+  invLogs.forEach(function(log) {
+    var pid = log.ProductID;
+    var qIn = parseFloat(log.QtyIn) || 0;
+    var qOut = parseFloat(log.QtyOut) || 0;
+    stockMap[pid] = (stockMap[pid] || 0) + (qIn - qOut);
+  });
+
+  var todayStr = Utilities.formatDate(new Date(), 'GMT+7', 'yyyy-MM-dd');
+  var allSales = getSheetDataAsObjects('tb_Sales', ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy']);
+  var allDetails = getSheetDataAsObjects('tb_SalesDetails', ['DetailID', 'SaleID', 'ProductID', 'ProductName', 'Quantity', 'UnitPrice', 'SubTotal']);
+
+  var factorySaleIds = {};
+  var rawFactorySales = [];
+
+  for (var i = 0; i < allSales.length; i++) {
+    var s = allSales[i];
+    var isToday = String(s.SaleDate || '').indexOf(todayStr) === 0;
+    var isManualAr = String(s.SaleID || '').indexOf('AR-') === 0;
+    if (!isToday || isManualAr) continue;
+
+    var rId = String(s.RouteID || '').trim();
+    var isFactorySale = (rId === '' || rId === 'หน้าลาน' || rId === 'หน้าร้าน' || rId === 'หน้าโรง' || rId === 'หน้าโรงงาน' || rId === 'WALK-IN');
+
+    if (isFactorySale) {
+      rawFactorySales.push(s);
+      factorySaleIds[s.SaleID] = true;
+    }
+  }
+
+  var summaryBySaleId = {};
+  var detailsBySaleId = {};
+  for (var j = 0; j < allDetails.length; j++) {
+    var d = allDetails[j];
+    if (!factorySaleIds[d.SaleID]) continue;
+    if (!summaryBySaleId[d.SaleID]) summaryBySaleId[d.SaleID] = [];
+    summaryBySaleId[d.SaleID].push(d.ProductName + ' x' + d.Quantity);
+    if (!detailsBySaleId[d.SaleID]) detailsBySaleId[d.SaleID] = [];
+    detailsBySaleId[d.SaleID].push(d);
+  }
+
+  var todaySales = [];
+  var prodSummaryMap = {};
+
+  products.forEach(function(p, idx) {
+    prodSummaryMap[p.ProductID] = {
+      id: p.ProductID,
+      name: p.ProductName,
+      category: 'สินค้าหลัก (ตัดสต๊อก)',
+      unit: p.Unit || 'กระสอบ',
+      qty: 0,
+      amount: 0,
+      order: idx + 1
+    };
+  });
+
+  rawFactorySales.forEach(function(s) {
+    s.ItemSummary = (summaryBySaleId[s.SaleID] || []).join(', ');
+    s.Items = detailsBySaleId[s.SaleID] || [];
+    todaySales.push(s);
+
+    if (s.PaymentStatus !== 'Cancelled' && s.PaymentStatus !== 'ยกเลิก') {
+      (detailsBySaleId[s.SaleID] || []).forEach(function(det) {
+        var pid = String(det.ProductID || '').trim();
+        var pname = String(det.ProductName || pid);
+        var q = parseFloat(det.Quantity) || 0;
+        var amt = parseFloat(det.SubTotal);
+        if (isNaN(amt)) amt = q * (parseFloat(det.UnitPrice) || 0);
+
+        var key = pid || pname;
+        if (!prodSummaryMap[key]) {
+          var cat = 'สินค้าหลัก (ตัดสต๊อก)';
+          var u = prodUnitMap[pid] || 'กระสอบ';
+          var ord = 50;
+          if (pid.indexOf('RET-') === 0) {
+            cat = 'ขายปลีก (ไม่ตัดสต๊อก)';
+            u = 'รายการ';
+            ord = 80;
+          } else if (pid === 'FEE') {
+            cat = 'ค่าธรรมเนียม/กระสอบ';
+            u = 'รายการ';
+            ord = 90;
+          } else if (pid === 'DISCOUNT') {
+            cat = 'หักส่วนลดท้ายบิล';
+            u = 'รายการ';
+            ord = 99;
+          }
+          prodSummaryMap[key] = { id: pid, name: pname, category: cat, unit: u, qty: 0, amount: 0, order: ord };
+        }
+        prodSummaryMap[key].qty += q;
+        prodSummaryMap[key].amount += amt;
+      });
+    }
+  });
+
+  var productSummary = Object.keys(prodSummaryMap).map(function(k) {
+    return prodSummaryMap[k];
+  }).filter(function(item) {
+    return item.qty > 0 || item.amount !== 0;
+  }).sort(function(a, b) {
+    return a.order - b.order;
+  });
+
+  return {
+    products: products,
+    customers: customers,
+    specialPrices: specialPrices,
+    promoMap: promoMap,
+    routes: routes,
+    stockMap: stockMap,
+    todaySales: todaySales.reverse(),
+    productSummary: productSummary
+  };
+}
+
+function api_saveSale(payload) {
+  return withSheetLock_(function() {
+    var items = payload.items || [];
+    if (items.length === 0) throw new Error('ไม่มีรายการสินค้าในตะกร้า');
+
+    var rId = String(payload.RouteID || 'หน้าลาน').trim();
+    var isRouteSale = (rId !== '' && rId !== 'หน้าลาน' && rId !== 'หน้าร้าน' && rId !== 'หน้าโรง' && rId !== 'หน้าโรงงาน' && rId !== 'WALK-IN');
+
+    // 🛡️ ตรวจสอบว่ากะสายส่งยังเปิดอยู่หรือไม่ (ป้องกันคนขับกดส่งบิลหลังจากเสมียนปิดกะไปแล้ว)
+    if (isRouteSale) {
+      assertRouteShiftActive_(rId, payload.CreatedBy || '');
+    }
+
+    var now = new Date();
+    var datePrefix = Utilities.formatDate(now, 'GMT+7', 'yyyyMMdd');
+    var salesHeaders = ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy'];
+    var detailHeaders = ['DetailID', 'SaleID', 'ProductID', 'ProductName', 'Quantity', 'UnitPrice', 'SubTotal'];
+    var invHeaders = ['InvLogID', 'LogDate', 'ProductID', 'ProductName', 'ActionType', 'QtyIn', 'QtyOut', 'Reference', 'CreatedBy', 'Note'];
+
+    var salesSheet = getOrCreateSheet('tb_Sales', salesHeaders);
+    var detailSheet = getOrCreateSheet('tb_SalesDetails', detailHeaders);
+    var invSheet = getOrCreateSheet('tb_InventoryLogs', invHeaders);
+
+    var saleId = generateId(salesSheet, 'SL-' + datePrefix, 4);
+    var totalAmount = 0;
+    var detailRows = [];
+    var invRows = [];
+
+    var detailLastRow = detailSheet.getLastRow();
+    var invLastRow = invSheet.getLastRow();
+
+    items.forEach(function(item, idx) {
+      var qty = parseFloat(item.Quantity) || 0;
+      var price = parseFloat(item.UnitPrice) || 0;
+      var sub = qty * price;
+      totalAmount += sub;
+
+      var pid = String(item.ProductID || '').trim();
+      var detId = 'DT-' + datePrefix + '-' + (detailLastRow + idx + 1).toString().padStart(4, '0');
+      detailRows.push([
+        detId,
+        saleId,
+        pid,
+        item.ProductName,
+        qty,
+        price,
+        sub
+      ]);
+
+      // ตัดสต๊อกคลังหลักเฉพาะสินค้าปกติที่ขายหน้าโรงงานเท่านั้น (รายการขายปลีก RET- จะไม่ถูกหักสต๊อก)
+      if (!isRouteSale && isStockProductId_(pid) && qty > 0) {
+        var invId = 'INV-' + datePrefix + '-' + (invLastRow + invRows.length + 1).toString().padStart(4, '0');
+        invRows.push([
+          invId,
+          now,
+          pid,
+          item.ProductName,
+          'ขายหน้าลาน',
+          0,
+          qty,
+          saleId,
+          payload.CreatedBy || 'POS',
+          'ลูกค้า: ' + (payload.CustomerName || 'ขาจร')
+        ]);
+      }
+    });
+
+    var payType = String(payload.PaymentType || 'เงินสด');
+    var isCredit = (payType.indexOf('เครดิต') !== -1 || payType.indexOf('บิลเชื่อ') !== -1 || payType.indexOf('ค้างชำระ') !== -1);
+    var payStatus = isCredit ? 'Unpaid' : 'Paid';
+
+    salesSheet.appendRow([
+      saleId,
+      now,
+      payload.CustomerID || 'WALK-IN',
+      payload.CustomerName || 'ขาจร',
+      rId || 'หน้าลาน',
+      totalAmount,
+      payType,
+      payStatus,
+      payload.CreatedBy || (isRouteSale ? 'Driver' : 'POS')
+    ]);
+
+    if (detailRows.length > 0) {
+      detailSheet.getRange(detailLastRow + 1, 1, detailRows.length, 7).setValues(detailRows);
+    }
+    if (invRows.length > 0) {
+      invSheet.getRange(invLastRow + 1, 1, invRows.length, 10).setValues(invRows);
+    }
+
+    SpreadsheetApp.flush();
+    writeLog('SAVE_SALE', saleId + ' (฿' + totalAmount + ')', 'SUCCESS');
+
+    return {
+      SaleID: saleId,
+      SaleDate: Utilities.formatDate(now, 'GMT+7', 'yyyy-MM-dd HH:mm'),
+      CustomerName: payload.CustomerName || 'ขาจร',
+      PaymentType: payType,
+      TotalAmount: totalAmount,
+      CashTendered: payload.CashTendered || totalAmount,
+      Change: payload.Change || 0,
+      Items: items
+    };
+  });
+}
+
+function api_cancelSale(payload) {
+  return withSheetLock_(function() {
+    var saleId = payload && payload.SaleID ? String(payload.SaleID).trim() : '';
+    var cancelReason = payload && payload.Reason ? String(payload.Reason).trim() : 'ทำรายการผิด';
+    var cancelledBy = payload && payload.CancelledBy ? String(payload.CancelledBy).trim() : 'Admin';
+
+    if (!saleId) throw new Error('ไม่พบเลขที่บิลที่ต้องการยกเลิก');
+
+    var salesHeaders = ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy'];
+    var salesSheet = getOrCreateSheet('tb_Sales', salesHeaders);
+    var sData = salesSheet.getDataRange().getValues();
+    var foundRow = -1;
+    var routeId = 'หน้าลาน';
+    var custName = '';
+    var billAmt = 0;
+
+    for (var i = 1; i < sData.length; i++) {
+      if (String(sData[i][0]) === saleId) {
+        if (sData[i][7] === 'Cancelled' || sData[i][7] === 'ยกเลิก') {
+          throw new Error('บิลนี้ถูกยกเลิกไปแล้วค่ะ');
+        }
+        foundRow = i + 1;
+        custName = String(sData[i][3] || '');
+        routeId = String(sData[i][4] || 'หน้าลาน').trim();
+        billAmt = parseFloat(sData[i][5]) || 0;
+        break;
+      }
+    }
+
+    if (foundRow === -1) throw new Error('ไม่พบเลขที่บิล: ' + saleId);
+
+    var isRouteSale = (routeId !== '' && routeId !== 'หน้าลาน' && routeId !== 'หน้าร้าน' && routeId !== 'หน้าโรง' && routeId !== 'หน้าโรงงาน' && routeId !== 'WALK-IN');
+    if (isRouteSale) {
+      assertRouteShiftActive_(routeId, cancelledBy);
+    }
+
+    salesSheet.getRange(foundRow, 8).setValue('Cancelled');
+
+    if (!isRouteSale) {
+      var details = getSheetDataAsObjects('tb_SalesDetails', ['DetailID', 'SaleID', 'ProductID', 'ProductName', 'Quantity', 'UnitPrice', 'SubTotal']);
+      var invHeaders = ['InvLogID', 'LogDate', 'ProductID', 'ProductName', 'ActionType', 'QtyIn', 'QtyOut', 'Reference', 'CreatedBy', 'Note'];
+      var invSheet = getOrCreateSheet('tb_InventoryLogs', invHeaders);
+      var invLastRow = invSheet.getLastRow();
+      var now = new Date();
+      var datePrefix = Utilities.formatDate(now, 'GMT+7', 'yyyyMMdd');
+      var refundRows = [];
+
+      details.forEach(function(d) {
+        var q = parseFloat(d.Quantity) || 0;
+        if (String(d.SaleID) === saleId && isStockProductId_(d.ProductID) && q > 0) {
+          var invId = 'INV-' + datePrefix + '-' + (invLastRow + refundRows.length + 1).toString().padStart(4, '0');
+          refundRows.push([
+            invId,
+            now,
+            d.ProductID,
+            d.ProductName,
+            'คืนสต๊อก (ยกเลิกบิล)',
+            q,
+            0,
+            saleId,
+            cancelledBy,
+            'ยกเลิกบิล ' + saleId + ' (' + cancelReason + ')'
+          ]);
+        }
+      });
+
+      if (refundRows.length > 0) {
+        invSheet.getRange(invLastRow + 1, 1, refundRows.length, 10).setValues(refundRows);
+      }
+    }
+
+    SpreadsheetApp.flush();
+    writeLog('CANCEL_SALE', saleId + ' | ร้าน: ' + custName + ' (฿' + billAmt + ') | โดย: ' + cancelledBy + ' | สาเหตุ: ' + cancelReason, 'WARNING');
+    return { SaleID: saleId, Status: 'Cancelled' };
+  });
+}
+
+// ==========================================
+// 👥 MODULE 3: CUSTOMER & PROMOTION ENGINE
+// ==========================================
+function api_getCustomers() {
+  var headers = ['CustomerID', 'CustomerName', 'Phone', 'CustomerType', 'RouteID', 'CreditLimit', 'Status', 'CreatedAt'];
+  var sheet = getOrCreateSheet('tb_Customers', headers);
+  if (sheet.getLastRow() <= 1) {
+    var now = new Date();
+    sheet.getRange(2, 1, 2, 8).setValues([
+      ['C-0001', 'ตั๊กน้ำปั่น', '081-234-5678', 'ร้านประจำ', 'RT-0001', 5000, 'Active', now],
+      ['C-0002', 'ครัวฮิมหนอง', '089-876-5432', 'ร้านประจำ', 'RT-0001', 10000, 'Active', now]
+    ]);
+  }
+  return getSheetDataAsObjects('tb_Customers', headers).filter(function(c) {
+    return c.Status !== 'Inactive';
+  }).reverse();
+}
+
+function getCustomerPromoMap_() {
+  var prmHeaders = ['PromoID', 'PromoName', 'DiscountAmt', 'Status', 'CreatedAt'];
+  getOrCreateSheet('tb_Promotions', prmHeaders);
+  var rows = getSheetDataAsObjects('tb_Promotions', prmHeaders);
+  var map = {};
+  rows.forEach(function(r) {
+    if (r.Status === 'Active' && String(r.PromoName).indexOf('3FOR100:') === 0) {
+      var cid = String(r.PromoName).replace('3FOR100:', '').trim();
+      var eligProds = String(r.DiscountAmt || 'ALL').trim();
+      map[cid] = { PromoID: r.PromoID, BundleQty: 3, BundlePrice: 100, EligibleProducts: eligProds };
+    }
+  });
+  return map;
+}
+
+function api_getCustomerDashboard() {
+  var customers = api_getCustomers();
+  var routes = getSheetDataAsObjects('tb_Routes', ['RouteID', 'RouteName', 'Description', 'Status', 'CreatedAt']);
+  var products = getSheetDataAsObjects('tb_Products', ['ProductID', 'ProductName', 'DefaultPrice', 'Unit', 'Status', 'CreatedAt']);
+  var specialPrices = getSheetDataAsObjects('tb_SpecialPrices', ['SpPriceID', 'CustomerID', 'ProductID', 'SpecialPrice', 'Status', 'CreatedAt']);
+  var sales = getSheetDataAsObjects('tb_Sales', ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy']);
+  var promoMap = getCustomerPromoMap_();
+
+  var routeMap = {};
+  routes.forEach(function(r) { routeMap[r.RouteID] = r.RouteName; });
+  var prodMap = {};
+  products.forEach(function(p) { prodMap[p.ProductID] = p.ProductName; });
+
+  var spByCust = {};
+  specialPrices.forEach(function(sp) {
+    if (sp.Status !== 'Inactive' && sp.SpecialPrice !== '') {
+      if (!spByCust[sp.CustomerID]) spByCust[sp.CustomerID] = [];
+      spByCust[sp.CustomerID].push({
+        ProductID: sp.ProductID,
+        ProductName: prodMap[sp.ProductID] || sp.ProductID,
+        Price: parseFloat(sp.SpecialPrice) || 0
+      });
+    }
+  });
+
+  // 🔍 วิเคราะห์วันที่ลงน้ำแข็งล่าสุดของแต่ละร้านจากตาราง tb_Sales
+  var lastSaleByCust = {};
+  var nameToCustId = {};
+  customers.forEach(function(c) {
+    if (c.CustomerName) nameToCustId[String(c.CustomerName).trim().toLowerCase()] = String(c.CustomerID).trim();
+  });
+
+  sales.forEach(function(s) {
+    var status = String(s.PaymentStatus || '');
+    if (status === 'Cancelled' || status === 'ยกเลิก') return;
+    if (String(s.SaleID || '').indexOf('AR-') === 0) return; // ไม่นับบิลตั้งหนี้ยกมาเป็นวันส่งน้ำแข็ง
+
+    var cid = String(s.CustomerID || '').trim();
+    if (!cid || cid === 'WALK-IN') {
+      var cNameKey = String(s.CustomerName || '').trim().toLowerCase();
+      if (nameToCustId[cNameKey]) cid = nameToCustId[cNameKey];
+    }
+    if (!cid || cid === 'WALK-IN') return;
+
+    var sDateStr = String(s.SaleDate || '').slice(0, 10);
+    if (!sDateStr) return;
+
+    if (!lastSaleByCust[cid]) {
+      lastSaleByCust[cid] = {
+        lastDate: sDateStr,
+        lastFullDate: String(s.SaleDate || '').slice(0, 16),
+        lastAmount: parseFloat(s.TotalAmount) || 0,
+        billCount: 0,
+        totalSpent: 0
+      };
+    }
+
+    lastSaleByCust[cid].billCount++;
+    lastSaleByCust[cid].totalSpent += (parseFloat(s.TotalAmount) || 0);
+
+    // เก็บวันที่ใหม่ที่สุด
+    if (sDateStr >= lastSaleByCust[cid].lastDate) {
+      lastSaleByCust[cid].lastDate = sDateStr;
+      lastSaleByCust[cid].lastFullDate = String(s.SaleDate || '').slice(0, 16);
+      lastSaleByCust[cid].lastAmount = parseFloat(s.TotalAmount) || 0;
+    }
+  });
+
+  // คำนวณจำนวนวันที่ขาดส่งนับถึงวันนี้ (ตามเวลาประเทศไทย GMT+7)
+  var todayStr = Utilities.formatDate(new Date(), 'GMT+7', 'yyyy-MM-dd');
+  var todayParts = todayStr.split('-');
+  var todayMidnight = new Date(parseInt(todayParts[0], 10), parseInt(todayParts[1], 10) - 1, parseInt(todayParts[2], 10)).getTime();
+
+  var enrichedCustomers = customers.map(function(c) {
+    var cid = String(c.CustomerID).trim();
+    var saleStat = lastSaleByCust[cid] || null;
+    var daysInactive = null; // null = ยังไม่เคยมีประวัติซื้อในระบบ
+
+    if (saleStat && saleStat.lastDate) {
+      var dp = saleStat.lastDate.split('-');
+      if (dp.length === 3) {
+        var lastMidnight = new Date(parseInt(dp[0], 10), parseInt(dp[1], 10) - 1, parseInt(dp[2], 10)).getTime();
+        daysInactive = Math.max(0, Math.round((todayMidnight - lastMidnight) / (1000 * 60 * 60 * 24)));
+      }
+    }
+
+    c.RouteName = routeMap[c.RouteID] || c.RouteID || 'หน้าลาน';
+    c.SpecialPrices = spByCust[c.CustomerID] || [];
+    c.HasPromo3For100 = !!promoMap[c.CustomerID];
+    c.PromoEligibleProducts = promoMap[c.CustomerID] ? promoMap[c.CustomerID].EligibleProducts : 'ALL';
+    c.LastSaleDate = saleStat ? saleStat.lastDate : '';
+    c.LastSaleAmount = saleStat ? saleStat.lastAmount : 0;
+    c.TotalBillsCount = saleStat ? saleStat.billCount : 0;
+    c.DaysInactive = daysInactive;
+    return c;
+  });
+
+  return {
+    customers: enrichedCustomers,
+    routes: routes,
+    products: products
+  };
+}
+function api_saveCustomer(payload) {
+  return withSheetLock_(function() {
+    var headers = ['CustomerID', 'CustomerName', 'Phone', 'CustomerType', 'RouteID', 'CreditLimit', 'Status', 'CreatedAt'];
+    var sheet = getOrCreateSheet('tb_Customers', headers);
+    var data = sheet.getDataRange().getValues();
+    var custId = payload.CustomerID;
+    var now = new Date();
+
+    if (custId && custId !== '') {
+      for (var i = 1; i < data.length; i++) {
+        if (String(data[i][0]) === String(custId)) {
+          sheet.getRange(i + 1, 2, 1, 6).setValues([[
+            payload.CustomerName,
+            payload.Phone || '',
+            payload.CustomerType || 'ร้านประจำ',
+            payload.RouteID || 'หน้าลาน',
+            parseFloat(payload.CreditLimit) || 0,
+            payload.Status || 'Active'
+          ]]);
+          break;
+        }
+      }
+    } else {
+      custId = generateId(sheet, 'C', 4);
+      sheet.appendRow([
+        custId,
+        payload.CustomerName,
+        payload.Phone || '',
+        payload.CustomerType || 'ร้านประจำ',
+        payload.RouteID || 'หน้าลาน',
+        parseFloat(payload.CreditLimit) || 0,
+        'Active',
+        now
+      ]);
+    }
+
+    if (Array.isArray(payload.SpecialPrices)) {
+      var spHeaders = ['SpPriceID', 'CustomerID', 'ProductID', 'SpecialPrice', 'Status', 'CreatedAt'];
+      var spSheet = getOrCreateSheet('tb_SpecialPrices', spHeaders);
+      var spData = spSheet.getDataRange().getValues();
+
+      payload.SpecialPrices.forEach(function(item) {
+        var foundRow = -1;
+        for (var j = 1; j < spData.length; j++) {
+          if (String(spData[j][1]) === String(custId) && String(spData[j][2]) === String(item.ProductID)) {
+            foundRow = j + 1;
+            break;
+          }
+        }
+        if (item.Price !== '' && item.Price !== null && !isNaN(item.Price)) {
+          if (foundRow > 0) {
+            spSheet.getRange(foundRow, 4, 1, 2).setValues([[parseFloat(item.Price), 'Active']]);
+          } else {
+            var newSpId = generateId(spSheet, 'SP', 4);
+            spSheet.appendRow([newSpId, custId, item.ProductID, parseFloat(item.Price), 'Active', now]);
+            spData.push([newSpId, custId, item.ProductID, parseFloat(item.Price), 'Active', now]);
+          }
+        } else if (foundRow > 0) {
+          spSheet.getRange(foundRow, 5).setValue('Inactive');
+        }
+      });
+    }
+
+    if (payload.HasPromo3For100 !== undefined) {
+      var prmHeaders = ['PromoID', 'PromoName', 'DiscountAmt', 'Status', 'CreatedAt'];
+      var prmSheet = getOrCreateSheet('tb_Promotions', prmHeaders);
+      var prmData = prmSheet.getDataRange().getValues();
+      var targetKey = '3FOR100:' + custId;
+      var eligProds = payload.PromoEligibleProducts || 'ALL';
+      var foundPrmRow = -1;
+
+      for (var k = 1; k < prmData.length; k++) {
+        if (String(prmData[k][1]).trim() === targetKey) {
+          foundPrmRow = k + 1;
+          break;
+        }
+      }
+
+      if (payload.HasPromo3For100) {
+        if (foundPrmRow > 0) {
+          prmSheet.getRange(foundPrmRow, 3, 1, 2).setValues([[eligProds, 'Active']]);
+        } else {
+          var newPrmId = generateId(prmSheet, 'PRM', 4);
+          prmSheet.appendRow([newPrmId, targetKey, eligProds, 'Active', now]);
+        }
+      } else if (foundPrmRow > 0) {
+        prmSheet.getRange(foundPrmRow, 4).setValue('Inactive');
+      }
+    }
+
+    SpreadsheetApp.flush();
+    writeLog('SAVE_CUSTOMER', custId + ' (' + payload.CustomerName + ')', 'SUCCESS');
+    return { CustomerID: custId };
+  });
+}
+
+// ==========================================
+// ⚙️ MODULE 4: DYNAMIC MASTER DATA
+// ==========================================
+var MASTER_SCHEMAS = {
+  'tb_Products':       { prefix: 'P',   headers: ['ProductID', 'ProductName', 'DefaultPrice', 'Unit', 'Status', 'CreatedAt'] },
+  'tb_Employees':      { prefix: 'EMP', headers: ['EmpID', 'EmpName', 'Phone', 'Position', 'PIN', 'Status', 'CreatedAt'] },
+  'tb_Vehicles':       { prefix: 'VEH', headers: ['VehicleID', 'LicensePlate', 'VehicleType', 'Capacity', 'Status', 'CreatedAt'] },
+  'tb_Routes':         { prefix: 'RT',  headers: ['RouteID', 'RouteName', 'Description', 'Status', 'CreatedAt'] },
+  'tb_SpecialPrices':  { prefix: 'SP',  headers: ['SpPriceID', 'CustomerID', 'ProductID', 'SpecialPrice', 'Status', 'CreatedAt'] },
+  'tb_Promotions':     { prefix: 'PRM', headers: ['PromoID', 'PromoName', 'DiscountAmt', 'Status', 'CreatedAt'] },
+  'tb_ProductMapping': { prefix: 'MAP', headers: ['MapID', 'SysProduct', 'VendorProduct', 'Status', 'CreatedAt'] }
+};
+
+function api_getMasterData(payload) {
+  var tbl = (typeof payload === 'object' && payload !== null) ? payload.tableName : payload;
+  tbl = String(tbl || '').trim();
+
+  var schema = MASTER_SCHEMAS[tbl];
+  if (!schema || !schema.headers) {
+    throw new Error('ไม่พบโครงสร้างตารางฐานข้อมูล: ' + (tbl || 'ไม่ได้ระบุชื่อตาราง'));
+  }
+
+  return getSheetDataAsObjects(tbl, schema.headers).reverse();
+}
+
+function api_saveMasterData(payload) {
+  return withSheetLock_(function() {
+    var tbl = payload && payload.tableName ? String(payload.tableName).trim() : '';
+    var schema = MASTER_SCHEMAS[tbl];
+    if (!schema || !schema.headers) {
+      throw new Error('ไม่พบโครงสร้างตารางสำหรับบันทึก: ' + tbl);
+    }
+
+    var sheet = getOrCreateSheet(tbl, schema.headers);
+    var record = payload.record || {};
+    var recordId = record[schema.headers[0]];
+    var data = sheet.getDataRange().getValues();
+
+    if (recordId && recordId !== '') {
+      for (var i = 1; i < data.length; i++) {
+        if (String(data[i][0]) === String(recordId)) {
+          var updatedRow = schema.headers.map(function(h, idx) {
+            if (idx === 0) return recordId;
+            if (h === 'Status') return record['Status'] || 'Active';
+            if (h === 'CreatedAt') return data[i][idx];
+            return record[h] !== undefined ? record[h] : data[i][idx];
+          });
+          sheet.getRange(i + 1, 1, 1, schema.headers.length).setValues([updatedRow]);
+          SpreadsheetApp.flush();
+          return { mode: 'update', id: recordId };
+        }
+      }
+    }
+
+    var newId = generateId(sheet, schema.prefix, 4);
+    var newRow = schema.headers.map(function(h, idx) {
+      if (idx === 0) return newId;
+      if (h === 'Status') return 'Active';
+      if (h === 'CreatedAt') return new Date();
+      return record[h] !== undefined ? record[h] : '';
+    });
+    sheet.appendRow(newRow);
+    SpreadsheetApp.flush();
+    return { mode: 'insert', id: newId };
+  });
+}
+
+// ==========================================
+// 🪣 MODULE 5: SMART BUCKET TRACKING
+// ==========================================
+function api_getBucketDashboard() {
+  var bucketHeaders = ['BucketID', 'SerialNumber', 'Capacity', 'BucketType', 'CurrentStatus', 'CurrentLocation', 'Note', 'Status', 'CreatedAt', 'LoanType', 'BorrowDate'];
+  var logHeaders = ['LogID', 'LogDate', 'ActionType', 'BucketType', 'CustomerID', 'CustomerName', 'SerialNumbers', 'TotalQty', 'Note', 'CreatedBy'];
+  
+  var bSheet = getOrCreateSheet('tb_Buckets', bucketHeaders);
+  if (bSheet.getLastRow() <= 1) {
+    var now = new Date();
+    bSheet.getRange(2, 1, 6, 11).setValues([
+      ['B-0001', '6023', '200L', 'ถังยืมร้าน', 'ในคลัง', 'โรงงานแม่ใจ', 'สภาพดี', 'Active', now, '', ''],
+      ['B-0002', '6601', '200L', 'ถังยืมร้าน', 'ถูกยืม', 'ตั๊กน้ำปั่น', '', 'Active', now, 'ถังยืมร้าน', now],
+      ['B-0003', '6813', '200L', 'ถังยืมร้าน', 'ถูกยืม', 'ตั๊กน้ำปั่น', '', 'Active', now, 'ถังยืมร้าน', now],
+      ['B-0004', '6608', '200L', 'ถังยืมร้าน', 'ถูกยืม', 'ครัวฮิมหนอง', '', 'Active', now, 'ถังยืมร้าน', now],
+      ['B-0005', '6713', '300L', 'ถังยืมงาน', 'ในคลัง', 'โรงงานแม่ใจ', '', 'Active', now, '', ''],
+      ['B-0006', '6817', '450L', 'ถังยืมร้าน', 'ในคลัง', 'โรงงานแม่ใจ', '', 'Active', now, '', '']
+    ]);
+  }
+
+  return {
+    allBuckets: getSheetDataAsObjects('tb_Buckets', bucketHeaders),
+    customers: api_getCustomers(),
+    recentLogs: getSheetDataAsObjects('tb_BucketLogs', logHeaders).reverse().slice(0, 30)
+  };
+}
+
+function api_saveBucketTransaction(payload) {
+  return withSheetLock_(function() {
+    var serials = payload.Serials || [];
+    if (!Array.isArray(serials) || serials.length === 0) {
+      throw new Error('กรุณาติ๊กเลือกรหัสถังอย่างน้อย 1 ใบ');
+    }
+    if (payload.mode === 'OUT' && (!payload.CustomerName || String(payload.CustomerName).trim() === '')) {
+      throw new Error('กรุณาเลือกลูกค้า หรือ ระบุชื่องานอีเวนต์');
+    }
+
+    var bucketHeaders = ['BucketID', 'SerialNumber', 'Capacity', 'BucketType', 'CurrentStatus', 'CurrentLocation', 'Note', 'Status', 'CreatedAt', 'LoanType', 'BorrowDate'];
+    var bSheet = getOrCreateSheet('tb_Buckets', bucketHeaders);
+    var lastRow = bSheet.getLastRow();
+    if (lastRow <= 1) throw new Error('ไม่พบข้อมูลถังในระบบ');
+
+    var range = bSheet.getRange(2, 1, lastRow - 1, 11);
+    var data = range.getValues();
+    var now = new Date();
+    var serialSet = {};
+    serials.forEach(function(s) { serialSet[String(s).trim()] = true; });
+
+    var updatedCount = 0;
+    var holderName = String(payload.CustomerName || '').trim();
+    var loanType = payload.LoanType || 'ถังยืมร้าน';
+
+    for (var i = 0; i < data.length; i++) {
+      var sn = String(data[i][1]).trim();
+      if (serialSet[sn]) {
+        if (payload.mode === 'OUT') {
+          data[i][4] = 'ถูกยืม';
+          data[i][5] = holderName;
+          if (payload.Note) data[i][6] = payload.Note;
+          data[i][9] = loanType;
+          data[i][10] = now;
+        } else {
+          if (!holderName) holderName = String(data[i][5]);
+          data[i][4] = 'ในคลัง';
+          data[i][5] = 'โรงงานแม่ใจ';
+          data[i][6] = payload.Note ? payload.Note : '';
+          data[i][9] = '';
+          data[i][10] = '';
+        }
+        updatedCount++;
+      }
+    }
+
+    if (updatedCount === 0) throw new Error('ไม่พบรหัสถังที่เลือกในฐานข้อมูล');
+    range.setValues(data);
+
+    var logHeaders = ['LogID', 'LogDate', 'ActionType', 'BucketType', 'CustomerID', 'CustomerName', 'SerialNumbers', 'TotalQty', 'Note', 'CreatedBy'];
+    var logSheet = getOrCreateSheet('tb_BucketLogs', logHeaders);
+    var logId = generateId(logSheet, 'BKL-' + Utilities.formatDate(now, 'GMT+7', 'yyyyMMdd'), 4);
+
+    logSheet.appendRow([
+      logId,
+      now,
+      payload.mode === 'OUT' ? 'ยืมถังออก' : 'คืนเข้าคลัง',
+      loanType,
+      payload.CustomerID || 'EVENT',
+      holderName || 'รับคืนหน้าลาน',
+      serials.join(', '),
+      updatedCount,
+      payload.Note || '',
+      'Admin'
+    ]);
+
+    SpreadsheetApp.flush();
+    writeLog('BUCKET_' + payload.mode, logId + ' (' + serials.join(',') + ')', 'SUCCESS');
+    return { LogID: logId, Updated: updatedCount };
+  });
+}
+
+// ==========================================
+// 🚚 MODULE 6: ROUTE DISPATCH, RELOAD, SETTLEMENT & FUEL (V4.8 Shift Guard & Auto-Return)
+// ==========================================
+function api_getRouteSettlementData() {
+  var dspHeaders = ['DispatchID', 'DispatchDate', 'RouteID', 'RouteName', 'VehicleID', 'DriverName', 'StartMileage', 'EndMileage', 'LoadedQty', 'SoldQty', 'ReturnedQty', 'LossQty', 'CashSales', 'TransferSales', 'CreditSales', 'FuelExpense', 'OtherExpense', 'ExpectedCash', 'ActualCash', 'CashDiff', 'Status', 'Note', 'LoadDetails'];
+  var fuelHeaders = ['FuelID', 'FuelDate', 'VehicleID', 'DriverName', 'Mileage', 'Liters', 'TotalCost', 'PaidBy', 'Note'];
+  var salesHeaders = ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy'];
+  var detailHeaders = ['DetailID', 'SaleID', 'ProductID', 'ProductName', 'Quantity', 'UnitPrice', 'SubTotal'];
+  var payHeaders = ['PaymentID', 'PaymentDate', 'CustomerID', 'CustomerName', 'RefSaleIDs', 'AmountPaid', 'PaymentMethod', 'CreatedBy', 'Note'];
+  var custHeaders = ['CustomerID', 'CustomerName', 'Phone', 'CustomerType', 'RouteID', 'CreditLimit', 'Status', 'CreatedAt'];
+
+  var dispatches = getSheetDataAsObjects('tb_RouteDispatches', dspHeaders);
+  var fuelLogs = getSheetDataAsObjects('tb_FuelLogs', fuelHeaders);
+  var routes = getSheetDataAsObjects('tb_Routes', ['RouteID', 'RouteName', 'Description', 'Status', 'CreatedAt']).filter(function(r) { return r.Status !== 'Inactive'; });
+  var vehicles = getSheetDataAsObjects('tb_Vehicles', ['VehicleID', 'LicensePlate', 'VehicleType', 'Capacity', 'Status', 'CreatedAt']).filter(function(v) { return v.Status !== 'Inactive'; });
+  var employees = getSheetDataAsObjects('tb_Employees', ['EmpID', 'EmpName', 'Phone', 'Position', 'PIN', 'Status', 'CreatedAt']).filter(function(e) { return e.Status !== 'Inactive'; });
+  var products = getSheetDataAsObjects('tb_Products', ['ProductID', 'ProductName', 'DefaultPrice', 'Unit', 'Status', 'CreatedAt']).filter(function(p) { return p.Status !== 'Inactive'; });
+
+  var allSales = getSheetDataAsObjects('tb_Sales', salesHeaders);
+  var allDetails = getSheetDataAsObjects('tb_SalesDetails', detailHeaders);
+  var allPayments = getSheetDataAsObjects('tb_Payments', payHeaders);
+  var allCustomers = getSheetDataAsObjects('tb_Customers', custHeaders).filter(function(c) { return c.Status !== 'Inactive'; });
+
+  var custRouteMap = {};
+  allCustomers.forEach(function(c) {
+    custRouteMap[String(c.CustomerID).trim()] = String(c.RouteID || '').trim();
+  });
+
+  var qtyBySaleId = {};
+  var prodSoldBySaleId = {};
+  var itemSummaryBySaleId = {};
+  allDetails.forEach(function(d) {
+    var pid = String(d.ProductID || '').trim();
+    var q = parseFloat(d.Quantity) || 0;
+    if (!itemSummaryBySaleId[d.SaleID]) itemSummaryBySaleId[d.SaleID] = [];
+    itemSummaryBySaleId[d.SaleID].push(d.ProductName + (q > 1 ? ' x' + q : ''));
+
+    if (isStockProductId_(pid)) {
+      qtyBySaleId[d.SaleID] = (qtyBySaleId[d.SaleID] || 0) + q;
+      if (!prodSoldBySaleId[d.SaleID]) prodSoldBySaleId[d.SaleID] = {};
+      prodSoldBySaleId[d.SaleID][pid] = (prodSoldBySaleId[d.SaleID][pid] || 0) + q;
+    }
+  });
+
+  var unpaidDebtByCust = {};
+  allSales.forEach(function(s) {
+    var pType = String(s.PaymentType || '');
+    var isCredit = (pType.indexOf('เครดิต') !== -1 || pType.indexOf('บิลเชื่อ') !== -1 || pType.indexOf('ค้างชำระ') !== -1 || pType.indexOf('ยอดยกมา') !== -1);
+    var isUnpaid = (s.PaymentStatus === 'Unpaid' || s.PaymentStatus === 'ค้างชำระ');
+    if (isCredit && isUnpaid) {
+      var cid = String(s.CustomerID || '').trim();
+      unpaidDebtByCust[cid] = (unpaidDebtByCust[cid] || 0) + (parseFloat(s.TotalAmount) || 0);
+    }
+  });
+
+  dispatches.forEach(function(dsp) {
+    if (dsp.Status === 'กำลังวิ่งส่ง') {
+      var dspDatePrefix = String(dsp.DispatchDate || '').slice(0, 10);
+      var rId = String(dsp.RouteID || '').trim();
+      var rName = String(dsp.RouteName || '').trim();
+      var drvName = String(dsp.DriverName || '').trim();
+      var vehId = String(dsp.VehicleID || '').trim();
+
+      var liveSoldQty = 0;
+      var liveCashOnlySales = 0;
+      var liveTransferSales = 0;
+      var liveCreditSales = 0;
+      var liveSoldByProd = {};
+      var custSalesMap = {};
+      var walkInGroupOrder = [];
+
+      allSales.forEach(function(s) {
+        var sDatePrefix = String(s.SaleDate || '').slice(0, 10);
+        var isSameDate = (sDatePrefix === dspDatePrefix);
+        var isSameRoute = (String(s.RouteID || '').trim() === rId || String(s.RouteID || '').trim() === rName);
+        var isValid = (s.PaymentStatus !== 'Cancelled' && s.PaymentStatus !== 'ยกเลิก' && String(s.SaleID || '').indexOf('AR-') !== 0);
+
+        if (isSameDate && isSameRoute && isValid) {
+          var amt = parseFloat(s.TotalAmount) || 0;
+          var pType = String(s.PaymentType || '');
+          var sQty = qtyBySaleId[s.SaleID] || 0;
+          liveSoldQty += sQty;
+
+          var sProdMap = prodSoldBySaleId[s.SaleID] || {};
+          for (var pid in sProdMap) {
+            liveSoldByProd[pid] = (liveSoldByProd[pid] || 0) + sProdMap[pid];
+          }
+
+          if (pType.indexOf('เครดิต') !== -1 || pType.indexOf('บิลเชื่อ') !== -1 || pType.indexOf('ค้างชำระ') !== -1) {
+            liveCreditSales += amt;
+          } else if (pType.indexOf('โอน') !== -1) {
+            liveTransferSales += amt;
+          } else {
+            liveCashOnlySales += amt;
+          }
+
+          var rawCid = String(s.CustomerID || 'WALK-IN').trim();
+          var rawCName = String(s.CustomerName || 'ลูกค้าขาจรทั่วไป').trim();
+          // 🚶 แยกกลุ่มลูกค้าขาจรตามชื่อที่คนขับระบุ (เช่น งานศพ 2 งาน จะแยกเป็น 2 รายการ ไม่ปนกัน!)
+          var groupKey = (rawCid === 'WALK-IN' || rawCid === '') ? ('WALK-IN::' + rawCName) : rawCid;
+
+          if (!custSalesMap[groupKey]) {
+            custSalesMap[groupKey] = {
+              CustomerID: groupKey,
+              RawCustomerID: rawCid,
+              CustomerName: rawCName,
+              count: 0,
+              totalAmt: 0,
+              totalQty: 0,
+              lastTime: String(s.SaleDate || '').slice(11, 16),
+              summaries: []
+            };
+            if (rawCid === 'WALK-IN' || rawCid === '') {
+              walkInGroupOrder.push(groupKey);
+            }
+          }
+          custSalesMap[groupKey].count++;
+          custSalesMap[groupKey].totalAmt += amt;
+          custSalesMap[groupKey].totalQty += sQty;
+          var sumTxt = (itemSummaryBySaleId[s.SaleID] || []).join(', ');
+          if (sumTxt) custSalesMap[groupKey].summaries.push(sumTxt + ' [' + pType + ']');
+        }
+      });
+
+      var liveDebtCash = 0;
+      var liveDebtTransfer = 0;
+      allPayments.forEach(function(p) {
+        if (String(p.PaymentDate || '').slice(0, 10) !== dspDatePrefix) return;
+        var pBy = String(p.CreatedBy || '');
+        var cRoute = custRouteMap[String(p.CustomerID || '').trim()] || '';
+        var isByThisDriver = (drvName !== '' && pBy.indexOf(drvName) !== -1);
+        var isThisRouteCust = (cRoute === rId || cRoute === rName);
+
+        if (isByThisDriver || isThisRouteCust) {
+          var pAmt = parseFloat(p.AmountPaid) || 0;
+          if (String(p.PaymentMethod || '').indexOf('โอน') !== -1) liveDebtTransfer += pAmt;
+          else liveDebtCash += pAmt;
+        }
+      });
+
+      var liveFuelCash = 0;
+      var liveFuelCredit = 0;
+      fuelLogs.forEach(function(f) {
+        if (String(f.FuelDate || '').slice(0, 10) !== dspDatePrefix) return;
+        var fDrv = String(f.DriverName || '').trim();
+        var fVeh = String(f.VehicleID || '').trim();
+        var matchDrv = (drvName !== '' && fDrv !== '' && (fDrv === drvName || fDrv.indexOf(drvName) !== -1 || drvName.indexOf(fDrv) !== -1));
+        var matchVeh = (vehId !== '' && fVeh !== '' && fVeh === vehId);
+
+        if (matchDrv || matchVeh) {
+          var fCost = parseFloat(f.TotalCost) || 0;
+          var paidBy = String(f.PaidBy || '');
+          if (paidBy.indexOf('เงินสด') !== -1 || paidBy.indexOf('หัก') !== -1) {
+            liveFuelCash += fCost;
+          } else {
+            liveFuelCredit += fCost;
+          }
+        }
+      });
+
+      var loadedItems = [];
+      try { loadedItems = JSON.parse(dsp.LoadDetails || '[]'); } catch (e) { loadedItems = []; }
+      var itemBreakdown = loadedItems.map(function(ld) {
+        var pid = String(ld.id);
+        var lQty = parseFloat(ld.qty) || 0;
+        var sQty = liveSoldByProd[pid] || 0;
+        return {
+          id: pid,
+          name: ld.name,
+          loadedQty: lQty,
+          soldQty: sQty,
+          expectedRemain: Math.max(0, lQty - sQty)
+        };
+      });
+
+      var routeCusts = allCustomers.filter(function(c) {
+        var cr = String(c.RouteID || '').trim();
+        return cr === rId || (rName !== '' && cr === rName);
+      });
+
+      var reportBoughtList = [];
+      var reportMissedList = [];
+      routeCusts.forEach(function(c) {
+        if (custSalesMap[c.CustomerID]) {
+          reportBoughtList.push(custSalesMap[c.CustomerID]);
+        } else {
+          reportMissedList.push({
+            CustomerID: c.CustomerID,
+            CustomerName: c.CustomerName,
+            Phone: c.Phone || '-',
+            TotalDebt: unpaidDebtByCust[c.CustomerID] || 0
+          });
+        }
+      });
+
+      // เพิ่มรายการลูกค้าขาจรแยกตามชื่อแต่ละงานต่อท้ายตารางร้านที่ซื้อ
+      walkInGroupOrder.forEach(function(wKey) {
+        var wInfo = custSalesMap[wKey];
+        if (wInfo) {
+          reportBoughtList.push({
+            CustomerID: wInfo.CustomerID,
+            CustomerName: wInfo.CustomerName + (wInfo.count > 1 ? ' (' + wInfo.count + ' บิล)' : ''),
+            count: wInfo.count,
+            totalAmt: wInfo.totalAmt,
+            totalQty: wInfo.totalQty,
+            lastTime: wInfo.lastTime,
+            summaries: wInfo.summaries
+          });
+        }
+      });
+
+      dsp.LiveSoldQty = liveSoldQty;
+      dsp.LiveCashOnlySales = liveCashOnlySales;
+      dsp.LiveDebtCash = liveDebtCash;
+      dsp.LiveDebtTransfer = liveDebtTransfer;
+      dsp.LiveCashSales = liveCashOnlySales + liveDebtCash;
+      dsp.LiveTransferSales = liveTransferSales;
+      dsp.LiveCreditSales = liveCreditSales;
+      dsp.LiveFuelCash = liveFuelCash;
+      dsp.LiveFuelExpense = liveFuelCash;
+      dsp.LiveFuelCredit = liveFuelCredit;
+      dsp.ItemBreakdown = itemBreakdown;
+      dsp.ReportBoughtList = reportBoughtList;
+      dsp.ReportMissedList = reportMissedList;
+    }
+  });
+
+  return {
+    dispatches: dispatches.reverse().slice(0, 40),
+    fuelLogs: fuelLogs.reverse().slice(0, 40),
+    routes: routes,
+    vehicles: vehicles,
+    employees: employees,
+    products: products
+  };
+}
+function api_createDispatch(payload) {
+  return withSheetLock_(function() {
+    var dspHeaders = ['DispatchID', 'DispatchDate', 'RouteID', 'RouteName', 'VehicleID', 'DriverName', 'StartMileage', 'EndMileage', 'LoadedQty', 'SoldQty', 'ReturnedQty', 'LossQty', 'CashSales', 'TransferSales', 'CreditSales', 'FuelExpense', 'OtherExpense', 'ExpectedCash', 'ActualCash', 'CashDiff', 'Status', 'Note', 'LoadDetails'];
+    var sheet = getOrCreateSheet('tb_RouteDispatches', dspHeaders);
+    var existingDispatches = getSheetDataAsObjects('tb_RouteDispatches', dspHeaders);
+
+    var reqRouteId = String(payload.RouteID || '').trim();
+    var reqDriver = String(payload.DriverName || '').trim();
+
+    // 🛡️ ป้องกันเสมียนเผลอเปิดกะซ้ำให้คนขับหรือสายส่งที่ยังไม่ได้ปิดกะเดิม
+    var duplicateActive = existingDispatches.find(function(d) {
+      if (String(d.Status || '').trim() !== 'กำลังวิ่งส่ง') return false;
+      var sameRoute = reqRouteId !== '' && String(d.RouteID || '').trim() === reqRouteId;
+      var sameDriver = reqDriver !== '' && String(d.DriverName || '').trim() === reqDriver;
+      return sameRoute || sameDriver;
+    });
+
+    if (duplicateActive) {
+      throw new Error('สายส่ง "' + duplicateActive.RouteName + '" (คนขับ: ' + duplicateActive.DriverName + ') มีกะที่กำลังวิ่งส่งอยู่แล้ว (' + duplicateActive.DispatchID + ') หากต้องการเพิ่มน้ำแข็ง กรุณากดปุ่ม "เบิกน้ำแข็งเพิ่ม" แทนการเปิดกะใหม่ค่ะ');
+    }
+
+    var now = new Date();
+    var datePrefix = Utilities.formatDate(now, 'GMT+7', 'yyyyMMdd');
+    var dspId = generateId(sheet, 'DSP-' + datePrefix, 4);
+    var loadedQty = parseFloat(payload.LoadedQty) || 0;
+    var noteStr = payload.LoadDetailsText ? ('เบิก: ' + payload.LoadDetailsText + (payload.Note ? ' | ' + payload.Note : '')) : (payload.Note || '');
+
+    sheet.appendRow([
+      dspId,
+      now,
+      reqRouteId,
+      payload.RouteName || '',
+      payload.VehicleID || '',
+      reqDriver,
+      parseFloat(payload.StartMileage) || 0,
+      0,
+      loadedQty,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      'กำลังวิ่งส่ง',
+      noteStr,
+      payload.LoadDetailsJSON || '[]'
+    ]);
+
+    var detailsArr = [];
+    try { detailsArr = JSON.parse(payload.LoadDetailsJSON || '[]'); } catch (e) { detailsArr = []; }
+    if (detailsArr.length > 0) {
+      var invHeaders = ['InvLogID', 'LogDate', 'ProductID', 'ProductName', 'ActionType', 'QtyIn', 'QtyOut', 'Reference', 'CreatedBy', 'Note'];
+      var invSheet = getOrCreateSheet('tb_InventoryLogs', invHeaders);
+      var invLastRow = invSheet.getLastRow();
+      var invRows = [];
+
+      detailsArr.forEach(function(item) {
+        var q = parseFloat(item.qty) || 0;
+        if (q > 0) {
+          var invId = 'INV-' + datePrefix + '-' + (invLastRow + invRows.length + 1).toString().padStart(4, '0');
+          invRows.push([
+            invId,
+            now,
+            item.id,
+            item.name,
+            'เบิกขึ้นรถ',
+            0,
+            q,
+            dspId,
+            reqDriver || 'Admin',
+            'ปล่อยรถสาย: ' + (payload.RouteName || reqRouteId)
+          ]);
+        }
+      });
+
+      if (invRows.length > 0) {
+        invSheet.getRange(invLastRow + 1, 1, invRows.length, 10).setValues(invRows);
+      }
+    }
+
+    SpreadsheetApp.flush();
+    writeLog('CREATE_DISPATCH', dspId + ' (' + payload.RouteName + ')', 'SUCCESS');
+    return { DispatchID: dspId };
+  });
+}
+
+function api_reloadDispatch(payload) {
+  return withSheetLock_(function() {
+    var dspId = payload && payload.DispatchID ? String(payload.DispatchID).trim() : '';
+    var addedQty = parseFloat(payload.AddedQty) || 0;
+    if (!dspId) throw new Error('ไม่พบรหัสใบปล่อยรถที่ต้องการเบิกเพิ่ม');
+    if (addedQty <= 0) throw new Error('กรุณาระบุจำนวนน้ำแข็งที่เบิกเพิ่มอย่างน้อย 1 รายการ');
+
+    var dspHeaders = ['DispatchID', 'DispatchDate', 'RouteID', 'RouteName', 'VehicleID', 'DriverName', 'StartMileage', 'EndMileage', 'LoadedQty', 'SoldQty', 'ReturnedQty', 'LossQty', 'CashSales', 'TransferSales', 'CreditSales', 'FuelExpense', 'OtherExpense', 'ExpectedCash', 'ActualCash', 'CashDiff', 'Status', 'Note', 'LoadDetails'];
+    var dspSheet = getOrCreateSheet('tb_RouteDispatches', dspHeaders);
+    var dspData = dspSheet.getDataRange().getValues();
+
+    var rowIdx = -1;
+    for (var i = 1; i < dspData.length; i++) {
+      if (String(dspData[i][0]) === dspId) {
+        if (dspData[i][20] !== 'กำลังวิ่งส่ง') {
+          throw new Error('ใบปล่อยรถนี้ปิดกะไปแล้ว ไม่สามารถเบิกเพิ่มได้');
+        }
+        rowIdx = i;
+        break;
+      }
+    }
+    if (rowIdx === -1) throw new Error('ไม่พบใบปล่อยรถรหัส: ' + dspId);
+
+    var addedArr = [];
+    try { addedArr = JSON.parse(payload.AddedDetailsJSON || '[]'); } catch (e) { addedArr = []; }
+    if (addedArr.length === 0) throw new Error('ข้อมูลรายการสินค้าไม่ถูกต้อง');
+
+    var currentLoadedQty = parseFloat(dspData[rowIdx][8]) || 0;
+    var newLoadedQty = currentLoadedQty + addedQty;
+
+    var currentDetails = [];
+    try { currentDetails = JSON.parse(dspData[rowIdx][22] || '[]'); } catch (e) { currentDetails = []; }
+
+    addedArr.forEach(function(addItem) {
+      var addQ = parseFloat(addItem.qty) || 0;
+      if (addQ <= 0) return;
+      var found = false;
+      currentDetails.forEach(function(curItem) {
+        if (String(curItem.id) === String(addItem.id)) {
+          curItem.qty = (parseFloat(curItem.qty) || 0) + addQ;
+          found = true;
+        }
+      });
+      if (!found) {
+        currentDetails.push({ id: addItem.id, name: addItem.name, qty: addQ });
+      }
+    });
+
+    var now = new Date();
+    var timeStr = Utilities.formatDate(now, 'GMT+7', 'HH:mm');
+    var oldNote = String(dspData[rowIdx][21] || '');
+    var newNote = oldNote + ' | เบิกเพิ่ม (' + timeStr + '): ' + (payload.AddedDetailsText || '') + (payload.Note ? ' [' + payload.Note + ']' : '');
+
+    dspSheet.getRange(rowIdx + 1, 9).setValue(newLoadedQty);
+    dspSheet.getRange(rowIdx + 1, 22, 1, 2).setValues([[newNote, JSON.stringify(currentDetails)]]);
+
+    var invHeaders = ['InvLogID', 'LogDate', 'ProductID', 'ProductName', 'ActionType', 'QtyIn', 'QtyOut', 'Reference', 'CreatedBy', 'Note'];
+    var invSheet = getOrCreateSheet('tb_InventoryLogs', invHeaders);
+    var invLastRow = invSheet.getLastRow();
+    var datePrefix = Utilities.formatDate(now, 'GMT+7', 'yyyyMMdd');
+    var invRows = [];
+    var routeName = dspData[rowIdx][3] || dspData[rowIdx][2];
+    var driverName = dspData[rowIdx][5] || 'Driver';
+
+    addedArr.forEach(function(item) {
+      var q = parseFloat(item.qty) || 0;
+      if (q > 0) {
+        var invId = 'INV-' + datePrefix + '-' + (invLastRow + invRows.length + 1).toString().padStart(4, '0');
+        invRows.push([
+          invId,
+          now,
+          item.id,
+          item.name,
+          'เบิกเพิ่มขึ้นรถ',
+          0,
+          q,
+          dspId,
+          payload.CreatedBy || driverName,
+          'เบิกเพิ่มระหว่างวัน สาย: ' + routeName + (payload.Note ? ' (' + payload.Note + ')' : '')
+        ]);
+      }
+    });
+
+    if (invRows.length > 0) {
+      invSheet.getRange(invLastRow + 1, 1, invRows.length, 10).setValues(invRows);
+    }
+
+    SpreadsheetApp.flush();
+    writeLog('RELOAD_DISPATCH', dspId + ' (+' + addedQty + ' หน่วย)', 'SUCCESS');
+    return { DispatchID: dspId, NewLoadedQty: newLoadedQty };
+  });
+}
+
+function api_closeDispatch(payload) {
+  return withSheetLock_(function() {
+    var dspHeaders = ['DispatchID', 'DispatchDate', 'RouteID', 'RouteName', 'VehicleID', 'DriverName', 'StartMileage', 'EndMileage', 'LoadedQty', 'SoldQty', 'ReturnedQty', 'LossQty', 'CashSales', 'TransferSales', 'CreditSales', 'FuelExpense', 'OtherExpense', 'ExpectedCash', 'ActualCash', 'CashDiff', 'Status', 'Note', 'LoadDetails'];
+    var sheet = getOrCreateSheet('tb_RouteDispatches', dspHeaders);
+    var data = sheet.getDataRange().getValues();
+    var foundRow = -1;
+    var dspRouteId = '';
+    var dspRouteName = '';
+    var dspDriverName = '';
+    var existingNote = '';
+
+    for (var i = 1; i < data.length; i++) {
+      if (String(data[i][0]).trim() === String(payload.DispatchID).trim()) {
+        foundRow = i + 1;
+        dspRouteId = String(data[i][2] || '').trim();
+        dspRouteName = String(data[i][3] || '').trim();
+        dspDriverName = String(data[i][5] || '').trim();
+        existingNote = String(data[i][21] || '');
+        break;
+      }
+    }
+    if (foundRow === -1) throw new Error('ไม่พบใบปล่อยรถรหัส: ' + payload.DispatchID);
+
+    var loadedQty = parseFloat(data[foundRow - 1][8]) || 0;
+    var soldQty = parseFloat(payload.SoldQty) || 0;
+    var returnedQty = parseFloat(payload.ReturnedQty) || 0;
+    var lossQty = Math.max(0, loadedQty - soldQty - returnedQty);
+
+    var cashSales = parseFloat(payload.CashSales) || 0;
+    var transferSales = parseFloat(payload.TransferSales) || 0;
+    var creditSales = parseFloat(payload.CreditSales) || 0;
+    var fuelExp = parseFloat(payload.FuelExpense) || 0;
+    var otherExp = parseFloat(payload.OtherExpense) || 0;
+
+    var expectedCash = cashSales - fuelExp - otherExp;
+    var actualCash = parseFloat(payload.ActualCash) || 0;
+    var cashDiff = actualCash - expectedCash;
+
+    var closeNote = payload.CloseNote ? (' | ปิดกะ: ' + payload.CloseNote) : '';
+    var finalNote = existingNote + closeNote;
+
+    sheet.getRange(foundRow, 8, 1, 15).setValues([[
+      parseFloat(payload.EndMileage) || parseFloat(data[foundRow - 1][7]) || 0,
+      loadedQty,
+      soldQty,
+      returnedQty,
+      lossQty,
+      cashSales,
+      transferSales,
+      creditSales,
+      fuelExp,
+      otherExp,
+      expectedCash,
+      actualCash,
+      cashDiff,
+      'ปิดกะแล้ว',
+      finalNote
+    ]]);
+
+    // 🛡️ กวาดปิดใบปล่อยรถที่อาจถูกเปิดซ้ำค้างไว้ในชื่อคนขับหรือสายส่งเดียวกันทั้งหมด เพื่อไม่ให้ค้างในมือถือคนขับ!
+    for (var k = 1; k < data.length; k++) {
+      if ((k + 1) === foundRow) continue;
+      var rowStatus = String(data[k][20] || '').trim();
+      var rowRouteId = String(data[k][2] || '').trim();
+      var rowDriver = String(data[k][5] || '').trim();
+      if (rowStatus === 'กำลังวิ่งส่ง' && ((dspRouteId !== '' && rowRouteId === dspRouteId) || (dspDriverName !== '' && rowDriver === dspDriverName))) {
+        sheet.getRange(k + 1, 21).setValue('ปิดกะแล้ว');
+      }
+    }
+
+    // 📦 บันทึกคืนสต๊อกน้ำแข็งกลับเข้าห้องเย็น (tb_InventoryLogs) อัตโนมัติเมื่อมีน้ำแข็งเหลือตีคืนคลัง!
+    var returnItems = payload.ReturnItems || [];
+    if (Array.isArray(returnItems) && returnItems.length > 0) {
+      var invHeaders = ['InvLogID', 'LogDate', 'ProductID', 'ProductName', 'ActionType', 'QtyIn', 'QtyOut', 'Reference', 'CreatedBy', 'Note'];
+      var invSheet = getOrCreateSheet('tb_InventoryLogs', invHeaders);
+      var invLastRow = invSheet.getLastRow();
+      var now = new Date();
+      var datePrefix = Utilities.formatDate(now, 'GMT+7', 'yyyyMMdd');
+      var invRows = [];
+
+      returnItems.forEach(function(item) {
+        var rQty = parseFloat(item.qty) || 0;
+        if (rQty > 0) {
+          var invId = 'INV-' + datePrefix + '-' + (invLastRow + invRows.length + 1).toString().padStart(4, '0');
+          invRows.push([
+            invId,
+            now,
+            item.id,
+            item.name,
+            'รับคืนจากรถสายส่ง (ปิดกะ)',
+            rQty,
+            0,
+            payload.DispatchID,
+            dspDriverName || 'Admin',
+            'ตีคืนคลังจาก ' + dspRouteName
+          ]);
+        }
+      });
+
+      if (invRows.length > 0) {
+        invSheet.getRange(invLastRow + 1, 1, invRows.length, 10).setValues(invRows);
+      }
+    }
+
+    SpreadsheetApp.flush();
+    writeLog('CLOSE_DISPATCH', payload.DispatchID + ' | ขาย: ' + soldQty + ' | คืน: ' + returnedQty + ' | หาย/ละลาย: ' + lossQty + ' | เงินส่งจริง: ฿' + actualCash + ' (Diff: ' + cashDiff + ')', lossQty > 0 || cashDiff < 0 ? 'WARNING' : 'SUCCESS');
+    return { DispatchID: payload.DispatchID, LossQty: lossQty, CashDiff: cashDiff };
+  });
+}
+
+function api_saveFuelLog(payload) {
+  return withSheetLock_(function() {
+    var headers = ['FuelID', 'FuelDate', 'VehicleID', 'DriverName', 'Mileage', 'Liters', 'TotalCost', 'PaidBy', 'Note'];
+    var sheet = getOrCreateSheet('tb_FuelLogs', headers);
+    var now = new Date();
+    var fuelId = generateId(sheet, 'FL-' + Utilities.formatDate(now, 'GMT+7', 'yyyyMMdd'), 4);
+
+    sheet.appendRow([
+      fuelId,
+      now,
+      payload.VehicleID || '',
+      payload.DriverName || '',
+      parseFloat(payload.Mileage) || 0,
+      parseFloat(payload.Liters) || 0,
+      parseFloat(payload.TotalCost) || 0,
+      payload.PaidBy || 'เงินสดหน้าลาน',
+      payload.Note || ''
+    ]);
+
+    SpreadsheetApp.flush();
+    writeLog('SAVE_FUEL', fuelId + ' (฿' + payload.TotalCost + ')', 'SUCCESS');
+    return { FuelID: fuelId };
+  });
+}
+// ==========================================
+// 💳 MODULE 7: CREDIT & AR COLLECTION (ฉบับสมบูรณ์: แยกหนี้ขาจร + รับชำระหนี้ + ตั้งหนี้ยกมา)
+// ==========================================
+function api_getCreditDashboard() {
+  var sales = getSheetDataAsObjects('tb_Sales', ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy']);
+  var saleDetails = getSheetDataAsObjects('tb_SalesDetails', ['DetailID', 'SaleID', 'ProductID', 'ProductName', 'Quantity', 'UnitPrice', 'SubTotal']);
+  var customers = api_getCustomers();
+  var routes = getSheetDataAsObjects('tb_Routes', ['RouteID', 'RouteName', 'Description', 'Status', 'CreatedAt']);
+  var payments = getSheetDataAsObjects('tb_Payments', ['PaymentID', 'PaymentDate', 'CustomerID', 'CustomerName', 'RefSaleIDs', 'AmountPaid', 'PaymentMethod', 'CreatedBy', 'Note']);
+
+  var routeMap = {};
+  routes.forEach(function(r) { routeMap[r.RouteID] = r.RouteName; });
+
+  var custMap = {};
+  customers.forEach(function(c) {
+    custMap[c.CustomerID] = {
+      CustomerID: c.CustomerID,
+      CustomerName: c.CustomerName,
+      Phone: c.Phone || '',
+      RouteID: c.RouteID || 'หน้าลาน',
+      RouteName: routeMap[c.RouteID] || c.RouteID || 'หน้าลาน',
+      CreditLimit: parseFloat(c.CreditLimit) || 0
+    };
+  });
+
+  var itemSummaryBySale = {};
+  saleDetails.forEach(function(d) {
+    if (!itemSummaryBySale[d.SaleID]) itemSummaryBySale[d.SaleID] = [];
+    itemSummaryBySale[d.SaleID].push(d.ProductName + (parseFloat(d.Quantity) > 1 ? ' x' + d.Quantity : ''));
+  });
+
+  var debtByCust = {};
+  var totalOutstanding = 0;
+  var totalUnpaidBills = 0;
+  var overLimitCount = 0;
+
+  sales.forEach(function(s) {
+    var pType = String(s.PaymentType || '');
+    var isCredit = (pType.indexOf('เครดิต') !== -1 || pType.indexOf('บิลเชื่อ') !== -1 || pType.indexOf('ค้างชำระ') !== -1 || pType.indexOf('ยอดยกมา') !== -1);
+    var isUnpaid = (s.PaymentStatus === 'Unpaid' || s.PaymentStatus === 'ค้างชำระ');
+
+    if (isCredit && isUnpaid) {
+      var rawCid = String(s.CustomerID || 'WALK-IN').trim();
+      var rawCName = String(s.CustomerName || 'ลูกค้าขาจรทั่วไป').trim();
+      var isWalkIn = (rawCid === 'WALK-IN' || rawCid === '');
+      var debtKey = isWalkIn ? ('WALK-IN::' + rawCName) : rawCid;
+
+      var cInfo = (!isWalkIn && custMap[rawCid]) ? custMap[rawCid] : {
+        CustomerID: debtKey,
+        CustomerName: isWalkIn ? ('🚶 ' + rawCName) : rawCName,
+        Phone: '',
+        RouteID: s.RouteID || 'หน้าลาน',
+        RouteName: routeMap[s.RouteID] || s.RouteID || 'หน้าลาน',
+        CreditLimit: 0
+      };
+
+      if (!debtByCust[debtKey]) {
+        debtByCust[debtKey] = {
+          CustomerID: debtKey,
+          RawCustomerID: rawCid,
+          CustomerName: cInfo.CustomerName,
+          Phone: cInfo.Phone,
+          RouteID: cInfo.RouteID,
+          RouteName: cInfo.RouteName,
+          CreditLimit: cInfo.CreditLimit,
+          TotalDebt: 0,
+          Bills: []
+        };
+      }
+      var amt = parseFloat(s.TotalAmount) || 0;
+      s.ItemSummary = (itemSummaryBySale[s.SaleID] || []).join(', ') || 'บิลค้างชำระ';
+      debtByCust[debtKey].TotalDebt += amt;
+      debtByCust[debtKey].Bills.push(s);
+      totalOutstanding += amt;
+      totalUnpaidBills++;
+    }
+  });
+
+  var debtList = Object.keys(debtByCust).map(function(k) {
+    var d = debtByCust[k];
+    if (d.CreditLimit > 0 && d.TotalDebt > d.CreditLimit) overLimitCount++;
+    return d;
+  }).sort(function(a, b) { return b.TotalDebt - a.TotalDebt; });
+
+  return {
+    summary: {
+      totalOutstanding: totalOutstanding,
+      debtorCount: debtList.length,
+      totalUnpaidBills: totalUnpaidBills,
+      overLimitCount: overLimitCount
+    },
+    debtList: debtList,
+    customers: customers,
+    routes: routes,
+    recentPayments: payments.reverse().slice(0, 30)
+  };
+}
+
+/**
+ * 💰 บันทึกรับชำระหนี้ค้าง (ใช้ทั้งฝั่งมือถือคนขับ และ หน้าลูกหนี้สำนักงาน)
+ */
+function api_savePayment(payload) {
+  return withSheetLock_(function() {
+    var saleIds = payload.SaleIDs || [];
+    if (!Array.isArray(saleIds) || saleIds.length === 0) {
+      throw new Error('กรุณาเลือกบิลที่ต้องการรับชำระอย่างน้อย 1 บิล');
+    }
+
+    var createdBy = String(payload.CreatedBy || 'Admin');
+    // 🛡️ หากเป็นการกดรับเงินจากมือถือคนขับ ต้องเช็กว่ากะสายส่งยังเปิดอยู่หรือไม่
+    if (createdBy.indexOf('คนขับ:') === 0 && typeof assertRouteShiftActive_ === 'function') {
+      var drvName = createdBy.replace('คนขับ:', '').trim();
+      assertRouteShiftActive_('', drvName);
+    }
+
+    var salesHeaders = ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy'];
+    var salesSheet = getOrCreateSheet('tb_Sales', salesHeaders);
+    var sData = salesSheet.getDataRange().getValues();
+
+    var targetSet = {};
+    saleIds.forEach(function(id) { targetSet[String(id).trim()] = true; });
+
+    var clearedCount = 0;
+    for (var i = 1; i < sData.length; i++) {
+      var sid = String(sData[i][0]).trim();
+      if (targetSet[sid]) {
+        salesSheet.getRange(i + 1, 8).setValue('Paid');
+        clearedCount++;
+      }
+    }
+
+    var payHeaders = ['PaymentID', 'PaymentDate', 'CustomerID', 'CustomerName', 'RefSaleIDs', 'AmountPaid', 'PaymentMethod', 'CreatedBy', 'Note'];
+    var paySheet = getOrCreateSheet('tb_Payments', payHeaders);
+    var now = new Date();
+    var datePrefix = Utilities.formatDate(now, 'GMT+7', 'yyyyMMdd');
+    var payId = generateId(paySheet, 'PAY-' + datePrefix, 4);
+    var amountPaid = parseFloat(payload.AmountPaid) || 0;
+
+    // แปลงรหัส WALK-IN::ชื่อขาจร ให้เก็บเป็นรหัสมาตรฐาน WALK-IN ในตาราง tb_Payments
+    var rawCid = String(payload.CustomerID || 'WALK-IN').trim();
+    var cleanCid = rawCid.indexOf('WALK-IN::') === 0 ? 'WALK-IN' : rawCid;
+    var cleanCName = String(payload.CustomerName || '').replace(/^🚶\s*/, '').trim() || 'ลูกค้า';
+
+    paySheet.appendRow([
+      payId,
+      now,
+      cleanCid,
+      cleanCName,
+      saleIds.join(', '),
+      amountPaid,
+      payload.PaymentMethod || 'เงินสด',
+      createdBy,
+      payload.Note || ''
+    ]);
+
+    SpreadsheetApp.flush();
+    writeLog('SAVE_PAYMENT', payId + ' รับชำระหนี้ ' + cleanCName + ' ฿' + amountPaid + ' (' + saleIds.join(',') + ')', 'SUCCESS');
+    return { PaymentID: payId, ClearedBills: clearedCount, AmountPaid: amountPaid };
+  });
+}
+
+/**
+ * 📝 บันทึกตั้งหนี้ยกมา / เพิ่มลูกหนี้เก่าเข้าระบบ (Manual AR Entry)
+ */
+function api_saveManualDebt(payload) {
+  return withSheetLock_(function() {
+    var cid = payload && payload.CustomerID ? String(payload.CustomerID).trim() : '';
+    var cname = payload && payload.CustomerName ? String(payload.CustomerName).trim() : '';
+    var amt = parseFloat(payload.Amount) || 0;
+    if (!cid || amt <= 0) throw new Error('กรุณาเลือกลูกค้าและระบุยอดหนี้ค้างให้ถูกต้อง');
+
+    var salesHeaders = ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy'];
+    var detailHeaders = ['DetailID', 'SaleID', 'ProductID', 'ProductName', 'Quantity', 'UnitPrice', 'SubTotal'];
+    var salesSheet = getOrCreateSheet('tb_Sales', salesHeaders);
+    var detailSheet = getOrCreateSheet('tb_SalesDetails', detailHeaders);
+
+    var now = new Date();
+    var billDate = payload.BillDate ? new Date(payload.BillDate + 'T08:00:00') : now;
+    if (isNaN(billDate.getTime())) billDate = now;
+
+    var datePrefix = Utilities.formatDate(billDate, 'GMT+7', 'yyyyMMdd');
+    var saleId = generateId(salesSheet, 'AR-' + datePrefix, 4);
+
+    salesSheet.appendRow([
+      saleId,
+      billDate,
+      cid,
+      cname,
+      payload.RouteID || 'หน้าลาน',
+      amt,
+      'เครดิต (ยอดยกมา)',
+      'Unpaid',
+      payload.CreatedBy || 'Admin'
+    ]);
+
+    detailSheet.appendRow([
+      saleId + '-1',
+      saleId,
+      'AR-MANUAL',
+      payload.Note ? ('ยอดหนี้คงค้างยกมา: ' + payload.Note) : 'ยอดหนี้คงค้างยกมา',
+      1,
+      amt,
+      amt
+    ]);
+
+    SpreadsheetApp.flush();
+    writeLog('MANUAL_DEBT', saleId + ' ตั้งหนี้ยกมา ' + cname + ' ฿' + amt, 'INFO');
+    return { SaleID: saleId };
+  });
+}
+// ==========================================
+// 📦 MODULE 8: INVENTORY MANAGEMENT
+// ==========================================
+function api_getInventoryDashboard() {
+  var products = getSheetDataAsObjects('tb_Products', ['ProductID', 'ProductName', 'DefaultPrice', 'Unit', 'Status', 'CreatedAt']);
+  var invLogs = getSheetDataAsObjects('tb_InventoryLogs', ['InvLogID', 'LogDate', 'ProductID', 'ProductName', 'ActionType', 'QtyIn', 'QtyOut', 'Reference', 'CreatedBy', 'Note']);
+  
+  var todayStr = Utilities.formatDate(new Date(), 'GMT+7', 'yyyy-MM-dd');
+  var stockMap = {}, todayProduction = 0, todayDispatch = 0, todayTransfer = 0;
+
+  products.forEach(function(p) {
+    stockMap[p.ProductID] = { ProductID: p.ProductID, ProductName: p.ProductName, Unit: p.Unit, Balance: 0, TotalIn: 0, TotalOut: 0 };
+  });
+
+  invLogs.forEach(function(log) {
+    var pid = log.ProductID;
+    var qIn = parseFloat(log.QtyIn) || 0;
+    var qOut = parseFloat(log.QtyOut) || 0;
+    if (!stockMap[pid]) {
+      stockMap[pid] = { ProductID: pid, ProductName: log.ProductName, Unit: 'กระสอบ', Balance: 0, TotalIn: 0, TotalOut: 0 };
+    }
+    stockMap[pid].Balance += (qIn - qOut);
+    stockMap[pid].TotalIn += qIn;
+    stockMap[pid].TotalOut += qOut;
+
+    if (log.LogDate && String(log.LogDate).indexOf(todayStr) === 0) {
+      var act = String(log.ActionType || '');
+      if (act === 'ผลิตเข้าคลัง' || act.indexOf('บด') !== -1) todayProduction += qIn;
+      if (act.indexOf('เบิก') !== -1 || act === 'ขายหน้าลาน') todayDispatch += qOut;
+      if (act.indexOf('โอน') !== -1) todayTransfer += (qIn + qOut);
+    }
+  });
+
+  return {
+    summary: { todayProduction: todayProduction, todayDispatch: todayDispatch, todayTransfer: todayTransfer },
+    balances: Object.keys(stockMap).map(function(k) { return stockMap[k]; }),
+    products: products,
+    recentLogs: invLogs.reverse().slice(0, 40)
+  };
+}
+
+function api_saveInventoryTransaction(payload) {
+  return withSheetLock_(function() {
+    if (!payload.items || payload.items.length === 0) {
+      throw new Error('กรุณาระบุจำนวนสินค้าอย่างน้อย 1 รายการ');
+    }
+    var headers = ['InvLogID', 'LogDate', 'ProductID', 'ProductName', 'ActionType', 'QtyIn', 'QtyOut', 'Reference', 'CreatedBy', 'Note'];
+    var sheet = getOrCreateSheet('tb_InventoryLogs', headers);
+    var lastRow = sheet.getLastRow();
+    var todayPrefix = 'INV-' + Utilities.formatDate(new Date(), 'GMT+7', 'yyyyMMdd');
+    var lastNum = 0;
+    
+    if (lastRow > 1) {
+      var lastIdStr = String(sheet.getRange(lastRow, 1).getValue());
+      var parts = lastIdStr.split('-');
+      lastNum = parseInt(parts[parts.length - 1], 10);
+      if (isNaN(lastNum)) lastNum = lastRow - 1; 
+    }
+
+    var now = new Date();
+    var rowsToInsert = [];
+
+    payload.items.forEach(function(item) {
+      var q = parseFloat(item.qty) || 0;
+      if (q <= 0) return;
+
+      lastNum++;
+      var itemFlow = item.flow || payload.Flow || 'IN';
+      var itemAction = item.actionType || payload.ActionType || 'ปรับปรุงสต๊อก';
+      var itemRef = item.reference !== undefined ? item.reference : (payload.Reference || '');
+      var itemNote = item.note !== undefined ? item.note : (payload.Note || '');
+
+      var qtyIn = itemFlow === 'IN' ? q : 0;
+      var qtyOut = itemFlow === 'OUT' ? q : 0;
+
+      rowsToInsert.push([
+        todayPrefix + '-' + lastNum.toString().padStart(4, '0'),
+        now,
+        item.id,
+        item.name,
+        itemAction,
+        qtyIn,
+        qtyOut,
+        itemRef,
+        payload.CreatedBy || 'Admin',
+        itemNote
+      ]);
+    });
+
+    if (rowsToInsert.length === 0) throw new Error('จำนวนสินค้าต้องมากกว่า 0');
+    sheet.getRange(lastRow + 1, 1, rowsToInsert.length, 10).setValues(rowsToInsert);
+    SpreadsheetApp.flush();
+    writeLog('INVENTORY_TX', (payload.ActionType || 'MIXED') + ' (' + rowsToInsert.length + ' รายการ)', 'SUCCESS');
+    return { Status: 'Success', Count: rowsToInsert.length };
+  });
+}
+
+// ==========================================
+// 🗃️ MODULE 9: BUCKET MASTER
+// ==========================================
+function api_getBucketsList() {
+  var headers = ['BucketID', 'SerialNumber', 'Capacity', 'BucketType', 'CurrentStatus', 'CurrentLocation', 'Note', 'Status', 'CreatedAt', 'LoanType', 'BorrowDate'];
+  getOrCreateSheet('tb_Buckets', headers);
+  var buckets = getSheetDataAsObjects('tb_Buckets', headers).reverse();
+  var summary = { total: 0, inStock: 0, borrowed: 0, maintenance: 0 };
+  
+  buckets.forEach(function(b) {
+    summary.total++;
+    if (b.CurrentStatus === 'ในคลัง') summary.inStock++;
+    else if (b.CurrentStatus === 'ถูกยืม') summary.borrowed++;
+    else summary.maintenance++;
+  });
+
+  return { buckets: buckets, summary: summary, customers: api_getCustomers() };
+}
+
+function api_saveBucketRecord(payload) {
+  return withSheetLock_(function() {
+    var headers = ['BucketID', 'SerialNumber', 'Capacity', 'BucketType', 'CurrentStatus', 'CurrentLocation', 'Note', 'Status', 'CreatedAt', 'LoanType', 'BorrowDate'];
+    var sheet = getOrCreateSheet('tb_Buckets', headers);
+    var data = sheet.getDataRange().getValues();
+    var now = new Date();
+
+    if (payload.BucketID && payload.BucketID !== '') {
+      for (var i = 1; i < data.length; i++) {
+        if (String(data[i][0]) === String(payload.BucketID)) {
+          var isBorrowed = payload.CurrentStatus === 'ถูกยืม';
+          var loanType = isBorrowed ? (data[i][9] || payload.BucketType) : '';
+          var borrowDate = isBorrowed ? (data[i][10] || now) : '';
+          var loc = payload.CurrentStatus === 'ในคลัง' ? 'โรงงานแม่ใจ' : (payload.CurrentLocation || 'ไม่ระบุ');
+          
+          sheet.getRange(i + 1, 2, 1, 6).setValues([[
+            payload.SerialNumber, payload.Capacity, payload.BucketType, payload.CurrentStatus, loc, payload.Note || ''
+          ]]);
+          sheet.getRange(i + 1, 10, 1, 2).setValues([[loanType, borrowDate]]);
+          SpreadsheetApp.flush();
+          return { BucketID: payload.BucketID };
+        }
+      }
+      throw new Error('ไม่พบข้อมูลถังรหัสนี้');
+    } else {
+      for (var j = 1; j < data.length; j++) {
+        if (String(data[j][1]).trim() === String(payload.SerialNumber).trim() && String(data[j][7]) !== 'Inactive') {
+          throw new Error('รหัสถัง (Serial) ' + payload.SerialNumber + ' มีอยู่ในระบบแล้ว');
+        }
+      }
+      var newId = generateId(sheet, 'B', 4);
+      var isNewBorrowed = payload.CurrentStatus === 'ถูกยืม';
+      sheet.appendRow([
+        newId, 
+        payload.SerialNumber, 
+        payload.Capacity || '200L', 
+        payload.BucketType || 'ถังยืมร้าน', 
+        payload.CurrentStatus || 'ในคลัง', 
+        payload.CurrentStatus === 'ในคลัง' ? 'โรงงานแม่ใจ' : (payload.CurrentLocation || 'โรงงานแม่ใจ'), 
+        payload.Note || '', 
+        'Active', 
+        now,
+        isNewBorrowed ? (payload.BucketType || 'ถังยืมร้าน') : '',
+        isNewBorrowed ? now : ''
+      ]);
+      SpreadsheetApp.flush();
+      return { BucketID: newId };
+    }
+  });
+}
+
+// ==========================================
+// 🚚 MODULE 10: DRIVER MOBILE PORTAL (V4.8 Strict Shift Binding & Customer Name Map)
+// ==========================================
+function api_getDriverInitData(payload) {
+  var empHeaders = ['EmpID', 'EmpName', 'Phone', 'Position', 'PIN', 'Status', 'CreatedAt'];
+  var empSheet = getOrCreateSheet('tb_Employees', empHeaders);
+  if (empSheet.getLastRow() <= 1) {
+    empSheet.appendRow(['EMP-0001', 'สมชาย (สายส่ง)', '081-111-1111', 'คนขับรถ', '1111', 'Active', new Date()]);
+  }
+
+  var employees = getSheetDataAsObjects('tb_Employees', empHeaders).filter(function(e) { return e.Status !== 'Inactive'; });
+  var pin = payload && payload.pin ? String(payload.pin).trim() : '';
+  if (!pin) throw new Error('กรุณากรอกรหัส PIN พนักงาน');
+
+  var driver = employees.find(function(e) {
+    var empPin = String(e.PIN || '').trim();
+    var phoneLast4 = String(e.Phone || '').replace(/\D/g, '').slice(-4);
+    return empPin === pin || (phoneLast4 !== '' && phoneLast4 === pin);
+  });
+
+  if (!driver) {
+    throw new Error('รหัส PIN ไม่ถูกต้อง กรุณาตรวจสอบกับเสมียนหน้าลาน');
+  }
+
+  var dspHeaders = ['DispatchID', 'DispatchDate', 'RouteID', 'RouteName', 'VehicleID', 'DriverName', 'StartMileage', 'EndMileage', 'LoadedQty', 'SoldQty', 'ReturnedQty', 'LossQty', 'CashSales', 'TransferSales', 'CreditSales', 'FuelExpense', 'OtherExpense', 'ExpectedCash', 'ActualCash', 'CashDiff', 'Status', 'Note', 'LoadDetails'];
+  var dispatches = getSheetDataAsObjects('tb_RouteDispatches', dspHeaders);
+  var activeDispatches = dispatches.filter(function(d) {
+    return String(d.Status || '').trim() === 'กำลังวิ่งส่ง';
+  });
+
+  var drvName = String(driver.EmpName || '').trim();
+  var myDispatch = null;
+
+  // 🛡️ จับคู่เฉพาะใบปล่อยรถที่เป็นชื่อของคนขับคนนี้เท่านั้น (ไม่ดึงกะของคนอื่นมาสวมรอยเด็ดขาด)
+  for (var i = activeDispatches.length - 1; i >= 0; i--) {
+    var dDrv = String(activeDispatches[i].DriverName || '').trim();
+    if (dDrv !== '' && drvName !== '' && (dDrv === drvName || dDrv.indexOf(drvName) !== -1 || drvName.indexOf(dDrv) !== -1)) {
+      myDispatch = activeDispatches[i];
+      break;
+    }
+  }
+
+  var vehicles = getSheetDataAsObjects('tb_Vehicles', ['VehicleID', 'LicensePlate', 'VehicleType', 'Capacity', 'Status', 'CreatedAt']);
+  var products = getSheetDataAsObjects('tb_Products', ['ProductID', 'ProductName', 'DefaultPrice', 'Unit', 'Status', 'CreatedAt']);
+
+  // 🏁 หากเสมียนกดปิดกะไปแล้ว (myDispatch === null) ให้ส่งข้อมูลว่างกลับไปทันที เพื่อล้างหน้าจอมือถือคนขับ!
+  if (!myDispatch) {
+    return {
+      driver: driver,
+      lockedRoute: null,
+      myDispatch: null,
+      otherActiveRoutes: [],
+      vehicles: vehicles,
+      products: products,
+      customers: [],
+      specialPrices: [],
+      promoMap: {},
+      customerDebtMap: {},
+      todayDebtPayments: [],
+      todayRouteSales: [],
+      todayTransfers: [],
+      todayFuelLogs: []
+    };
+  }
+
+  var myRouteId = String(myDispatch.RouteID || '').trim();
+  var myRouteName = String(myDispatch.RouteName || '').trim();
+  var allRoutes = getSheetDataAsObjects('tb_Routes', ['RouteID', 'RouteName', 'Description', 'Status', 'CreatedAt']);
+  var lockedRoute = allRoutes.find(function(r) { return String(r.RouteID) === myRouteId; }) || { RouteID: myRouteId, RouteName: myRouteName };
+
+  var otherActiveRoutes = activeDispatches.filter(function(d) {
+    return String(d.DispatchID) !== String(myDispatch.DispatchID);
+  }).map(function(d) {
+    return { DispatchID: d.DispatchID, RouteID: d.RouteID, RouteName: d.RouteName, DriverName: d.DriverName, VehicleID: d.VehicleID };
+  });
+
+  var allCustomers = api_getCustomers();
+  var myCustIdSet = {};
+  var custNameById = {};
+  var myCustomers = allCustomers.filter(function(c) {
+    var cRoute = String(c.RouteID || '').trim();
+    var match = (cRoute === myRouteId || (myRouteName !== '' && cRoute === myRouteName));
+    if (match) {
+      myCustIdSet[String(c.CustomerID)] = true;
+      custNameById[String(c.CustomerID)] = c.CustomerName;
+    }
+    return match;
+  });
+
+  var allSpecialPrices = getSheetDataAsObjects('tb_SpecialPrices', ['SpPriceID', 'CustomerID', 'ProductID', 'SpecialPrice', 'Status', 'CreatedAt']);
+  var mySpecialPrices = allSpecialPrices.filter(function(sp) {
+    return sp.Status !== 'Inactive' && myCustIdSet[String(sp.CustomerID)];
+  });
+  var promoMap = getCustomerPromoMap_();
+
+  // ใช้กรอบวันที่ของใบปล่อยรถ (หรือวันนี้) เพื่อดึงเฉพาะบิลในกะนี้
+  var dspDatePrefix = String(myDispatch.DispatchDate || '').slice(0, 10) || Utilities.formatDate(new Date(), 'GMT+7', 'yyyy-MM-dd');
+  var sales = getSheetDataAsObjects('tb_Sales', ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy']);
+  
+  var targetSaleIds = {};
+  var rawTodaySales = [];
+  var rawUnpaidSales = [];
+
+  for (var sIdx = 0; sIdx < sales.length; sIdx++) {
+    var s = sales[sIdx];
+    var sStatus = String(s.PaymentStatus || '');
+    if (sStatus === 'Cancelled' || sStatus === 'ยกเลิก') continue;
+
+    var sRoute = String(s.RouteID || '');
+    var sCustId = String(s.CustomerID || '');
+    var isMyRouteSale = (sRoute === myRouteId || (myRouteName !== '' && sRoute === myRouteName));
+    var isMyCustSale = !!myCustIdSet[sCustId];
+
+    if (!isMyRouteSale && !isMyCustSale) continue;
+
+    var isManualAr = String(s.SaleID || '').indexOf('AR-') === 0;
+    var isSameShiftDate = String(s.SaleDate || '').indexOf(dspDatePrefix) === 0;
+    var isUnpaid = (sStatus === 'Unpaid' || sStatus === 'ค้างชำระ');
+    var pType = String(s.PaymentType || '');
+    var isCredit = (pType.indexOf('เครดิต') !== -1 || pType.indexOf('บิลเชื่อ') !== -1 || pType.indexOf('ค้างชำระ') !== -1 || pType.indexOf('ยอดยกมา') !== -1);
+
+    if (!isManualAr && isSameShiftDate && isMyRouteSale) {
+      rawTodaySales.push(s);
+      targetSaleIds[s.SaleID] = true;
+    }
+    if (isUnpaid && isCredit) {
+      rawUnpaidSales.push(s);
+      targetSaleIds[s.SaleID] = true;
+    }
+  }
+
+  var saleDetails = getSheetDataAsObjects('tb_SalesDetails', ['DetailID', 'SaleID', 'ProductID', 'ProductName', 'Quantity', 'UnitPrice', 'SubTotal']);
+  var qtyBySaleId = {};
+  var itemSummaryBySaleId = {};
+  var itemDetailsBySaleId = {};
+
+  for (var dIdx = 0; dIdx < saleDetails.length; dIdx++) {
+    var d = saleDetails[dIdx];
+    var sid = d.SaleID;
+    if (!targetSaleIds[sid]) continue;
+
+    var q = parseFloat(d.Quantity) || 0;
+    if (isStockProductId_(d.ProductID)) {
+      qtyBySaleId[sid] = (qtyBySaleId[sid] || 0) + q;
+      if (!itemDetailsBySaleId[sid]) itemDetailsBySaleId[sid] = [];
+      itemDetailsBySaleId[sid].push({
+        ProductID: String(d.ProductID),
+        ProductName: String(d.ProductName),
+        Quantity: q
+      });
+    }
+    if (!itemSummaryBySaleId[sid]) itemSummaryBySaleId[sid] = [];
+    itemSummaryBySaleId[sid].push(d.ProductName + (q > 1 ? ' x' + q : ''));
+  }
+
+  var todayRouteSales = rawTodaySales.map(function(s) {
+    s.TotalQty = qtyBySaleId[s.SaleID] || 0;
+    s.ItemSummary = (itemSummaryBySaleId[s.SaleID] || []).join(', ');
+    s.Items = itemDetailsBySaleId[s.SaleID] || [];
+    return s;
+  }).reverse();
+
+var customerDebtMap = {};
+  rawUnpaidSales.forEach(function(s) {
+    var rawCid = String(s.CustomerID || 'WALK-IN').trim();
+    var resolvedCustName = String(s.CustomerName || custNameById[rawCid] || 'ลูกค้าขาจรทั่วไป').trim();
+    var isWalkIn = (rawCid === 'WALK-IN' || rawCid === '');
+    // 🚶 แยกคีย์หนี้ค้างของลูกค้าขาจรตามชื่องาน เพื่อให้ตรงกับการ์ดในมือถือคนขับ V5.0 เป๊ะ 100%
+    var debtKey = isWalkIn ? ('WALK-IN::' + resolvedCustName) : rawCid;
+
+    if (!customerDebtMap[debtKey]) {
+      customerDebtMap[debtKey] = {
+        CustomerID: debtKey,
+        RawCustomerID: rawCid,
+        CustomerName: resolvedCustName,
+        IsWalkIn: isWalkIn,
+        totalDebt: 0,
+        billCount: 0,
+        bills: []
+      };
+    }
+    var bAmt = parseFloat(s.TotalAmount) || 0;
+    customerDebtMap[debtKey].totalDebt += bAmt;
+    customerDebtMap[debtKey].billCount++;
+    customerDebtMap[debtKey].bills.push({
+      SaleID: s.SaleID,
+      SaleDate: String(s.SaleDate || '').slice(0, 10),
+      CustomerName: resolvedCustName,
+      TotalAmount: bAmt,
+      ItemSummary: (itemSummaryBySaleId[s.SaleID] || []).join(', ') || 'ยอดค้างชำระ'
+    });
+  });
+  var trfHeaders = ['TransferID', 'TransferDate', 'FromDispatchID', 'FromRouteID', 'FromRouteName', 'ToDispatchID', 'ToRouteID', 'ToRouteName', 'ProductID', 'ProductName', 'Quantity', 'Unit', 'CreatedBy', 'Note'];
+  var allTransfers = getSheetDataAsObjects('tb_IceTransfers', trfHeaders);
+  var todayTransfers = allTransfers.filter(function(t) {
+    var isSameShiftDate = String(t.TransferDate || '').indexOf(dspDatePrefix) === 0;
+    var isInvolved = String(t.FromRouteID) === myRouteId || String(t.ToRouteID) === myRouteId || String(t.FromDispatchID) === String(myDispatch.DispatchID) || String(t.ToDispatchID) === String(myDispatch.DispatchID);
+    return isSameShiftDate && isInvolved;
+  }).reverse();
+
+  var fuelHeaders = ['FuelID', 'FuelDate', 'VehicleID', 'DriverName', 'Mileage', 'Liters', 'TotalCost', 'PaidBy', 'Note'];
+  var allFuels = getSheetDataAsObjects('tb_FuelLogs', fuelHeaders);
+  var myVeh = String(myDispatch.VehicleID || '').trim();
+  var myDspDrv = String(myDispatch.DriverName || '').trim();
+
+  var todayFuelLogs = allFuels.filter(function(f) {
+    var isSameShiftDate = String(f.FuelDate || '').indexOf(dspDatePrefix) === 0;
+    if (!isSameShiftDate) return false;
+    var fDrv = String(f.DriverName || '').trim();
+    var fVeh = String(f.VehicleID || '').trim();
+    var matchDrv = (fDrv !== '' && (fDrv === drvName || fDrv === myDspDrv || fDrv.indexOf(drvName) !== -1 || drvName.indexOf(fDrv) !== -1));
+    var matchVeh = (myVeh !== '' && fVeh === myVeh);
+    return matchDrv || matchVeh;
+  }).reverse();
+
+  var payHeaders = ['PaymentID', 'PaymentDate', 'CustomerID', 'CustomerName', 'RefSaleIDs', 'AmountPaid', 'PaymentMethod', 'CreatedBy', 'Note'];
+  var allPayments = getSheetDataAsObjects('tb_Payments', payHeaders);
+  var todayDebtPayments = allPayments.filter(function(p) {
+    var isSameShiftDate = String(p.PaymentDate || '').indexOf(dspDatePrefix) === 0;
+    var isByDriver = String(p.CreatedBy || '').indexOf(drvName) !== -1 || myCustIdSet[String(p.CustomerID)];
+    return isSameShiftDate && isByDriver;
+  }).reverse();
+
+  return {
+    driver: driver,
+    lockedRoute: lockedRoute,
+    myDispatch: myDispatch,
+    otherActiveRoutes: otherActiveRoutes,
+    vehicles: vehicles,
+    products: products,
+    customers: myCustomers,
+    specialPrices: mySpecialPrices,
+    promoMap: promoMap,
+    customerDebtMap: customerDebtMap,
+    todayDebtPayments: todayDebtPayments,
+    todayRouteSales: todayRouteSales,
+    todayTransfers: todayTransfers,
+    todayFuelLogs: todayFuelLogs
+  };
+}
+
+function api_saveIceTransfer(payload) {
+  return withSheetLock_(function() {
+    var qty = parseFloat(payload.Quantity) || 0;
+    if (qty <= 0) throw new Error('กรุณาระบุจำนวนน้ำแข็งที่ต้องการโอนให้ถูกต้อง');
+    if (!payload.FromDispatchID || !payload.ToDispatchID) throw new Error('กรุณาเลือกสายส่งปลายทางที่ต้องการโอนไป');
+    if (String(payload.FromDispatchID) === String(payload.ToDispatchID)) throw new Error('ไม่สามารถโอนเข้าสายส่งตัวเองได้');
+
+    var dspHeaders = ['DispatchID', 'DispatchDate', 'RouteID', 'RouteName', 'VehicleID', 'DriverName', 'StartMileage', 'EndMileage', 'LoadedQty', 'SoldQty', 'ReturnedQty', 'LossQty', 'CashSales', 'TransferSales', 'CreditSales', 'FuelExpense', 'OtherExpense', 'ExpectedCash', 'ActualCash', 'CashDiff', 'Status', 'Note', 'LoadDetails'];
+    var dspSheet = getOrCreateSheet('tb_RouteDispatches', dspHeaders);
+    var dspData = dspSheet.getDataRange().getValues();
+
+    var fromRowIdx = -1, toRowIdx = -1;
+    for (var i = 1; i < dspData.length; i++) {
+      if (String(dspData[i][0]) === String(payload.FromDispatchID)) fromRowIdx = i;
+      if (String(dspData[i][0]) === String(payload.ToDispatchID)) toRowIdx = i;
+    }
+
+    if (fromRowIdx === -1) throw new Error('ไม่พบใบปล่อยรถต้นทาง');
+    if (toRowIdx === -1) throw new Error('ไม่พบใบปล่อยรถปลายทางที่กำลังวิ่งอยู่');
+    if (String(dspData[fromRowIdx][20]) !== 'กำลังวิ่งส่ง') throw new Error('ใบปล่อยรถต้นทางปิดกะไปแล้ว ไม่สามารถโอนได้');
+
+    var pid = String(payload.ProductID);
+    var pname = String(payload.ProductName || '');
+
+    var fromLoadedQty = (parseFloat(dspData[fromRowIdx][8]) || 0) - qty;
+    var fromDetails = [];
+    try { fromDetails = JSON.parse(dspData[fromRowIdx][22] || '[]'); } catch (e) { fromDetails = []; }
+    fromDetails.forEach(function(item) {
+      if (String(item.id) === pid) item.qty = Math.max(0, (parseFloat(item.qty) || 0) - qty);
+    });
+    var fromNote = String(dspData[fromRowIdx][21] || '') + ' | โอนให้ ' + dspData[toRowIdx][3] + ': ' + pname + ' x' + qty;
+    dspSheet.getRange(fromRowIdx + 1, 9).setValue(fromLoadedQty);
+    dspSheet.getRange(fromRowIdx + 1, 22, 1, 2).setValues([[fromNote, JSON.stringify(fromDetails)]]);
+
+    var toLoadedQty = (parseFloat(dspData[toRowIdx][8]) || 0) + qty;
+    var toDetails = [];
+    try { toDetails = JSON.parse(dspData[toRowIdx][22] || '[]'); } catch (e) { toDetails = []; }
+    var foundInTo = false;
+    toDetails.forEach(function(item) {
+      if (String(item.id) === pid) {
+        item.qty = (parseFloat(item.qty) || 0) + qty;
+        foundInTo = true;
+      }
+    });
+    if (!foundInTo) {
+      toDetails.push({ id: pid, name: pname, qty: qty });
+    }
+    var toNote = String(dspData[toRowIdx][21] || '') + ' | รับโอนจาก ' + dspData[fromRowIdx][3] + ': ' + pname + ' x' + qty;
+    dspSheet.getRange(toRowIdx + 1, 9).setValue(toLoadedQty);
+    dspSheet.getRange(toRowIdx + 1, 22, 1, 2).setValues([[toNote, JSON.stringify(toDetails)]]);
+
+    var trfHeaders = ['TransferID', 'TransferDate', 'FromDispatchID', 'FromRouteID', 'FromRouteName', 'ToDispatchID', 'ToRouteID', 'ToRouteName', 'ProductID', 'ProductName', 'Quantity', 'Unit', 'CreatedBy', 'Note'];
+    var trfSheet = getOrCreateSheet('tb_IceTransfers', trfHeaders);
+    var now = new Date();
+    var trfId = generateId(trfSheet, 'TRF-' + Utilities.formatDate(now, 'GMT+7', 'yyyyMMdd'), 4);
+
+    trfSheet.appendRow([
+      trfId,
+      now,
+      payload.FromDispatchID,
+      dspData[fromRowIdx][2],
+      dspData[fromRowIdx][3],
+      payload.ToDispatchID,
+      dspData[toRowIdx][2],
+      dspData[toRowIdx][3],
+      pid,
+      pname,
+      qty,
+      payload.Unit || 'หน่วย',
+      payload.DriverName || 'คนขับรถ',
+      payload.Note || ''
+    ]);
+
+    SpreadsheetApp.flush();
+    writeLog('ICE_TRANSFER', trfId + ': ' + dspData[fromRowIdx][3] + ' -> ' + dspData[toRowIdx][3] + ' (' + pname + ' x' + qty + ')', 'SUCCESS');
+    return { TransferID: trfId };
+  });
+}
+
+function api_updateDriverMileage(payload) {
+  return withSheetLock_(function() {
+    var dspId = payload && payload.DispatchID ? String(payload.DispatchID).trim() : '';
+    var type = payload && payload.Type ? String(payload.Type).toUpperCase().trim() : 'START';
+    var mile = parseFloat(payload.Mileage) || 0;
+
+    if (!dspId) throw new Error('ไม่พบรหัสใบปล่อยรถ');
+    if (mile <= 0) throw new Error('กรุณากรอกเลขไมล์หน้าปัดรถให้ถูกต้อง (ต้องมากกว่า 0)');
+
+    var dspHeaders = ['DispatchID', 'DispatchDate', 'RouteID', 'RouteName', 'VehicleID', 'DriverName', 'StartMileage', 'EndMileage', 'LoadedQty', 'SoldQty', 'ReturnedQty', 'LossQty', 'CashSales', 'TransferSales', 'CreditSales', 'FuelExpense', 'OtherExpense', 'ExpectedCash', 'ActualCash', 'CashDiff', 'Status', 'Note', 'LoadDetails'];
+    var sheet = getOrCreateSheet('tb_RouteDispatches', dspHeaders);
+    var data = sheet.getDataRange().getValues();
+
+    for (var i = 1; i < data.length; i++) {
+      if (String(data[i][0]) === dspId) {
+        var currentStart = parseFloat(data[i][6]) || 0;
+        if (type === 'START') {
+          sheet.getRange(i + 1, 7).setValue(mile);
+        } else {
+          if (currentStart > 0 && mile < currentStart) {
+            throw new Error('เลขไมล์หลังส่งเสร็จ (' + mile + ') ต้องไม่น้อยกว่าเลขไมล์ก่อนออกส่ง (' + currentStart + ')');
+          }
+          sheet.getRange(i + 1, 8).setValue(mile);
+        }
+        SpreadsheetApp.flush();
+        writeLog('DRIVER_MILEAGE_' + type, dspId + ' -> ' + mile + ' km', 'SUCCESS');
+        return { DispatchID: dspId, Type: type, Mileage: mile };
+      }
+    }
+    throw new Error('ไม่พบใบปล่อยรถรหัส: ' + dspId);
+  });
+}
+// ==========================================
+// 📈 MODULE 11: HISTORICAL BUSINESS REPORTS & CUSTOMER MONTHLY PERFORMANCE ENGINE
+// ==========================================
+function api_getHistoricalReport(payload) {
+  var todayStr = Utilities.formatDate(new Date(), 'GMT+7', 'yyyy-MM-dd');
+  var startDate = (payload && payload.startDate) ? String(payload.startDate).trim() : todayStr;
+  var endDate = (payload && payload.endDate) ? String(payload.endDate).trim() : todayStr;
+  var filterRoute = (payload && payload.routeId) ? String(payload.routeId).trim() : 'ALL';
+
+  var sales = getSheetDataAsObjects('tb_Sales', ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy']);
+  var saleDetails = getSheetDataAsObjects('tb_SalesDetails', ['DetailID', 'SaleID', 'ProductID', 'ProductName', 'Quantity', 'UnitPrice', 'SubTotal']);
+  var routes = getSheetDataAsObjects('tb_Routes', ['RouteID', 'RouteName', 'Description', 'Status', 'CreatedAt']);
+  var customers = api_getCustomers();
+  var payments = getSheetDataAsObjects('tb_Payments', ['PaymentID', 'PaymentDate', 'CustomerID', 'CustomerName', 'RefSaleIDs', 'AmountPaid', 'PaymentMethod', 'CreatedBy', 'Note']);
+  var dispatches = getSheetDataAsObjects('tb_RouteDispatches', ['DispatchID', 'DispatchDate', 'RouteID', 'RouteName', 'VehicleID', 'DriverName', 'StartMileage', 'EndMileage', 'LoadedQty', 'SoldQty', 'ReturnedQty', 'LossQty', 'CashSales', 'TransferSales', 'CreditSales', 'FuelExpense', 'OtherExpense', 'ExpectedCash', 'ActualCash', 'CashDiff', 'Status', 'Note', 'LoadDetails']);
+  var fuelLogs = getSheetDataAsObjects('tb_FuelLogs', ['FuelID', 'FuelDate', 'VehicleID', 'DriverName', 'Mileage', 'Liters', 'TotalCost', 'PaidBy', 'Note']);
+  var invLogs = getSheetDataAsObjects('tb_InventoryLogs', ['InvLogID', 'LogDate', 'ProductID', 'ProductName', 'ActionType', 'QtyIn', 'QtyOut', 'Reference', 'CreatedBy', 'Note']);
+  var buckets = getSheetDataAsObjects('tb_Buckets', ['BucketID', 'SerialNumber', 'Capacity', 'BucketType', 'CurrentStatus', 'CurrentLocation', 'Note', 'Status', 'CreatedAt', 'LoanType', 'BorrowDate']);
+  var specialPrices = getSheetDataAsObjects('tb_SpecialPrices', ['SpPriceID', 'CustomerID', 'ProductID', 'SpecialPrice', 'Status', 'CreatedAt']);
+  var promoMap = getCustomerPromoMap_();
+
+  var routeNameMap = { 'หน้าลาน': '🏠 หน้าลาน (หน้าร้าน)', 'หน้าร้าน': '🏠 หน้าลาน (หน้าร้าน)' };
+  routes.forEach(function(r) {
+    if (r.RouteID) routeNameMap[String(r.RouteID).trim()] = r.RouteName;
+    if (r.RouteName) routeNameMap[String(r.RouteName).trim()] = r.RouteName;
+  });
+
+  var custRouteMap = {};
+  var custObjMap = {};
+  var nameToCustId = {};
+  customers.forEach(function(c) {
+    var cid = String(c.CustomerID).trim();
+    var cName = String(c.CustomerName || '').trim();
+    custRouteMap[cid] = String(c.RouteID || 'หน้าลาน').trim();
+    custObjMap[cid] = c;
+    if (cName) nameToCustId[cName.toLowerCase()] = cid;
+  });
+
+  // แผนที่ราคาพิเศษและถังที่ยืมอยู่ของแต่ละร้าน
+  var spCountByCust = {};
+  specialPrices.forEach(function(sp) {
+    if (sp.Status !== 'Inactive' && sp.SpecialPrice !== '') {
+      var cid = String(sp.CustomerID).trim();
+      spCountByCust[cid] = (spCountByCust[cid] || 0) + 1;
+    }
+  });
+
+  var bucketsByHolder = {};
+  buckets.forEach(function(b) {
+    if (b.Status !== 'Inactive' && b.CurrentStatus === 'ถูกยืม') {
+      var holderKey = String(b.CurrentLocation || '').trim().toLowerCase();
+      if (!holderKey) return;
+      if (!bucketsByHolder[holderKey]) bucketsByHolder[holderKey] = [];
+      bucketsByHolder[holderKey].push(b.SerialNumber + ' (' + b.Capacity + ')');
+    }
+  });
+
+  function normalizeRoute_(rawRoute, custId) {
+    var r = String(rawRoute || '').trim();
+    if (!r || r === 'หน้าลาน' || r === 'หน้าร้าน' || r === 'หน้าโรง' || r === 'หน้าโรงงาน' || r === 'WALK-IN') {
+      return 'หน้าลาน';
+    }
+    for (var i = 0; i < routes.length; i++) {
+      if (routes[i].RouteID === r || routes[i].RouteName === r) return routes[i].RouteID;
+    }
+    return r;
+  }
+
+  function inDateRange_(dateStr) {
+    var d = String(dateStr || '').slice(0, 10);
+    return (d >= startDate && d <= endDate);
+  }
+
+  function matchRouteFilter_(rKey) {
+    if (filterRoute === 'ALL') return true;
+    return rKey === filterRoute || (routeNameMap[rKey] && routeNameMap[rKey] === filterRoute);
+  }
+
+  // คำนวณจำนวนวันในช่วงที่เลือก (อย่างน้อย 1 วัน) เพื่อหาค่าเฉลี่ยกระสอบต่อวัน
+  var sParts = startDate.split('-');
+  var eParts = endDate.split('-');
+  var periodDays = 1;
+  if (sParts.length === 3 && eParts.length === 3) {
+    var sTime = new Date(parseInt(sParts[0], 10), parseInt(sParts[1], 10) - 1, parseInt(sParts[2], 10)).getTime();
+    var eTime = new Date(parseInt(eParts[0], 10), parseInt(eParts[1], 10) - 1, parseInt(eParts[2], 10)).getTime();
+    periodDays = Math.max(1, Math.round((eTime - sTime) / (1000 * 60 * 60 * 24)) + 1);
+  }
+
+  var matchedSaleIds = {};
+  var filteredSales = [];
+  var cancelledSales = [];
+
+  for (var i = 0; i < sales.length; i++) {
+    var s = sales[i];
+    if (!inDateRange_(s.SaleDate)) continue;
+    if (String(s.SaleID || '').indexOf('AR-') === 0) continue;
+
+    var rKey = normalizeRoute_(s.RouteID, s.CustomerID);
+    if (!matchRouteFilter_(rKey)) continue;
+
+    s.RouteKey = rKey;
+    s.RouteName = routeNameMap[rKey] || rKey;
+    matchedSaleIds[s.SaleID] = true;
+
+    if (s.PaymentStatus === 'Cancelled' || s.PaymentStatus === 'ยกเลิก') {
+      cancelledSales.push(s);
+    } else {
+      filteredSales.push(s);
+    }
+  }
+
+  var qtyBySale = {};
+  var summaryBySale = {};
+  var skuBySale = {};
+
+  for (var j = 0; j < saleDetails.length; j++) {
+    var det = saleDetails[j];
+    if (!matchedSaleIds[det.SaleID]) continue;
+
+    var q = parseFloat(det.Quantity) || 0;
+    var pName = String(det.ProductName || '');
+    if (!summaryBySale[det.SaleID]) summaryBySale[det.SaleID] = [];
+    summaryBySale[det.SaleID].push(pName + (q > 1 ? ' x' + q : ''));
+
+    if (isStockProductId_(det.ProductID)) {
+      qtyBySale[det.SaleID] = (qtyBySale[det.SaleID] || 0) + q;
+      if (!skuBySale[det.SaleID]) skuBySale[det.SaleID] = { bigTube: 0, crushed: 0, smallTube: 0, block: 0, other: 0 };
+      if (pName.indexOf('หลอดใหญ่') !== -1) skuBySale[det.SaleID].bigTube += q;
+      else if (pName.indexOf('บด') !== -1) skuBySale[det.SaleID].crushed += q;
+      else if (pName.indexOf('หลอดเล็ก') !== -1) skuBySale[det.SaleID].smallTube += q;
+      else if (pName.indexOf('ก้อน') !== -1 || pName.indexOf('ซอง') !== -1) skuBySale[det.SaleID].block += q;
+      else skuBySale[det.SaleID].other += q;
+    }
+  }
+
+  var routeMatrix = {
+    'หน้าลาน': { RouteKey: 'หน้าลาน', RouteName: '🏠 หน้าลาน (หน้าร้าน)', billCount: 0, iceQty: 0, cashSales: 0, transferSales: 0, creditSales: 0, totalSales: 0, debtCash: 0, debtTransfer: 0, fuelCash: 0, fuelTotal: 0, distanceKm: 0 }
+  };
+  routes.forEach(function(r) {
+    if (r.Status !== 'Inactive') {
+      routeMatrix[r.RouteID] = { RouteKey: r.RouteID, RouteName: '🚚 ' + r.RouteName, billCount: 0, iceQty: 0, cashSales: 0, transferSales: 0, creditSales: 0, totalSales: 0, debtCash: 0, debtTransfer: 0, fuelCash: 0, fuelTotal: 0, distanceKm: 0 };
+    }
+  });
+
+  function getRouteRow_(rKey) {
+    if (!routeMatrix[rKey]) {
+      routeMatrix[rKey] = { RouteKey: rKey, RouteName: routeNameMap[rKey] || rKey, billCount: 0, iceQty: 0, cashSales: 0, transferSales: 0, creditSales: 0, totalSales: 0, debtCash: 0, debtTransfer: 0, fuelCash: 0, fuelTotal: 0, distanceKm: 0 };
+    }
+    return routeMatrix[rKey];
+  }
+
+  // 🏆 เตรียมโครงสร้างสะสมยอดซื้อรายร้านค้า (Customer Monthly Performance Map)
+  var custPerfMap = {};
+  customers.forEach(function(c) {
+    var cid = String(c.CustomerID).trim();
+    var cRouteKey = normalizeRoute_(c.RouteID, cid);
+    if (!matchRouteFilter_(cRouteKey)) return;
+
+    var cNameLower = String(c.CustomerName || '').trim().toLowerCase();
+    var heldBuckets = bucketsByHolder[cNameLower] || [];
+
+    custPerfMap[cid] = {
+      CustomerID: cid,
+      CustomerName: c.CustomerName,
+      Phone: c.Phone || '',
+      RouteID: cRouteKey,
+      RouteName: routeNameMap[cRouteKey] || cRouteKey,
+      HasSpecialPrice: (spCountByCust[cid] || 0) > 0,
+      HasPromo3For100: !!promoMap[cid],
+      BucketCount: heldBuckets.length,
+      BucketSerials: heldBuckets.join(', '),
+      billCount: 0,
+      activeDaysMap: {},
+      activeDaysCount: 0,
+      bigTubeQty: 0,
+      crushedQty: 0,
+      smallTubeQty: 0,
+      blockQty: 0,
+      totalIceQty: 0,
+      cashAmt: 0,
+      transferAmt: 0,
+      creditAmt: 0,
+      totalAmt: 0,
+      lastSaleDate: ''
+    };
+  });
+
+  var kpi = { totalSales: 0, cashSales: 0, transferSales: 0, creditSales: 0, billCount: 0, totalIceQty: 0, debtCollectedTotal: 0, debtCollectedCash: 0, debtCollectedTransfer: 0, totalFuelCost: 0, totalFuelCash: 0, totalDistanceKm: 0, totalLossQty: 0, cancelledCount: cancelledSales.length };
+
+  filteredSales.forEach(function(s) {
+    var amt = parseFloat(s.TotalAmount) || 0;
+    var q = qtyBySale[s.SaleID] || 0;
+    var pType = String(s.PaymentType || 'เงินสด');
+    var rRow = getRouteRow_(s.RouteKey);
+
+    s.TotalQty = q;
+    s.ItemSummary = (summaryBySale[s.SaleID] || []).join(', ') || '-';
+
+    kpi.totalSales += amt;
+    kpi.billCount++;
+    kpi.totalIceQty += q;
+
+    rRow.billCount++;
+    rRow.iceQty += q;
+    rRow.totalSales += amt;
+
+    var isCredit = (pType.indexOf('เครดิต') !== -1 || pType.indexOf('บิลเชื่อ') !== -1 || pType.indexOf('ค้างชำระ') !== -1);
+    var isTrf = (pType.indexOf('โอน') !== -1);
+
+    if (isCredit) {
+      kpi.creditSales += amt;
+      rRow.creditSales += amt;
+    } else if (isTrf) {
+      kpi.transferSales += amt;
+      rRow.transferSales += amt;
+    } else {
+      kpi.cashSales += amt;
+      rRow.cashSales += amt;
+    }
+
+    // สะสมยอดเข้าลูกค้ารายร้าน
+    var rawCid = String(s.CustomerID || 'WALK-IN').trim();
+    if (rawCid === 'WALK-IN' || !custPerfMap[rawCid]) {
+      var matchedByName = nameToCustId[String(s.CustomerName || '').trim().toLowerCase()];
+      if (matchedByName && custPerfMap[matchedByName]) rawCid = matchedByName;
+    }
+
+    var custKey = custPerfMap[rawCid] ? rawCid : ('WALKIN:' + (s.CustomerName || 'ลูกค้าขาจรทั่วไป'));
+    if (!custPerfMap[custKey]) {
+      var wNameLower = String(s.CustomerName || '').trim().toLowerCase();
+      var wBuckets = bucketsByHolder[wNameLower] || [];
+      custPerfMap[custKey] = {
+        CustomerID: rawCid,
+        CustomerName: s.CustomerName || 'ลูกค้าขาจรทั่วไป',
+        Phone: '',
+        RouteID: s.RouteKey,
+        RouteName: s.RouteName,
+        HasSpecialPrice: false,
+        HasPromo3For100: false,
+        BucketCount: wBuckets.length,
+        BucketSerials: wBuckets.join(', '),
+        billCount: 0,
+        activeDaysMap: {},
+        activeDaysCount: 0,
+        bigTubeQty: 0,
+        crushedQty: 0,
+        smallTubeQty: 0,
+        blockQty: 0,
+        totalIceQty: 0,
+        cashAmt: 0,
+        transferAmt: 0,
+        creditAmt: 0,
+        totalAmt: 0,
+        lastSaleDate: ''
+      };
+    }
+
+    var cPerf = custPerfMap[custKey];
+    var sDay = String(s.SaleDate || '').slice(0, 10);
+    cPerf.billCount++;
+    if (sDay) {
+      cPerf.activeDaysMap[sDay] = true;
+      if (sDay > cPerf.lastSaleDate) cPerf.lastSaleDate = sDay;
+    }
+
+    var sk = skuBySale[s.SaleID] || { bigTube: 0, crushed: 0, smallTube: 0, block: 0, other: 0 };
+    cPerf.bigTubeQty += sk.bigTube;
+    cPerf.crushedQty += sk.crushed;
+    cPerf.smallTubeQty += sk.smallTube;
+    cPerf.blockQty += (sk.block + sk.other);
+    cPerf.totalIceQty += q;
+    cPerf.totalAmt += amt;
+
+    if (isCredit) cPerf.creditAmt += amt;
+    else if (isTrf) cPerf.transferAmt += amt;
+    else cPerf.cashAmt += amt;
+  });
+
+  // คำนวณค่าเฉลี่ยและจัดอันดับลูกค้า (Customer Ranking)
+  var customerRankingList = Object.keys(custPerfMap).map(function(k) {
+    var c = custPerfMap[k];
+    c.activeDaysCount = Object.keys(c.activeDaysMap).length;
+    delete c.activeDaysMap;
+    c.avgQtyPerPeriodDay = Number((c.totalIceQty / periodDays).toFixed(1));
+    c.avgQtyPerOrderDay = c.activeDaysCount > 0 ? Number((c.totalIceQty / c.activeDaysCount).toFixed(1)) : 0;
+
+    // วิเคราะห์ความคุ้มค่าถังน้ำแข็ง (ถ้ามีถังค้างอยู่ แต่ซื้อเฉลี่ยต่อวันน้อยกว่า 1 กระสอบต่อถัง)
+    var roiStatus = 'NONE';
+    if (c.BucketCount > 0) {
+      if (c.totalIceQty === 0) roiStatus = 'DEAD_BUCKET'; // ยึดถังฟรี ไม่ซื้อเลย!
+      else if (c.avgQtyPerPeriodDay < (c.BucketCount * 1.0)) roiStatus = 'LOW_ROI'; // ซื้อน้อยกว่า 1 กระสอบ/วัน/ถัง
+      else roiStatus = 'GOOD_ROI';
+    }
+    c.BucketROIStatus = roiStatus;
+    return c;
+  }).filter(function(c) {
+    // แสดงร้านที่มีการซื้อ หรือ ร้านที่มีถังค้างอยู่ หรือ ร้านที่ได้ราคาพิเศษ/โปรโมชั่น
+    return c.billCount > 0 || c.BucketCount > 0 || c.HasSpecialPrice || c.HasPromo3For100;
+  }).sort(function(a, b) {
+    if (b.totalAmt !== a.totalAmt) return b.totalAmt - a.totalAmt;
+    return b.BucketCount - a.BucketCount;
+  });
+
+  cancelledSales.forEach(function(cs) {
+    cs.ItemSummary = (summaryBySale[cs.SaleID] || []).join(', ') || '-';
+  });
+
+  var filteredPayments = [];
+  payments.forEach(function(p) {
+    if (!inDateRange_(p.PaymentDate)) return;
+    var cRoute = custRouteMap[String(p.CustomerID || '').trim()] || 'หน้าลาน';
+    var rKey = (cRoute && cRoute !== 'หน้าลาน') ? normalizeRoute_(cRoute, p.CustomerID) : 'หน้าลาน';
+    if (!matchRouteFilter_(rKey)) return;
+
+    var pAmt = parseFloat(p.AmountPaid) || 0;
+    var method = String(p.PaymentMethod || 'เงินสด');
+    var rRow = getRouteRow_(rKey);
+
+    p.RouteName = rRow.RouteName;
+    filteredPayments.push(p);
+
+    kpi.debtCollectedTotal += pAmt;
+    if (method.indexOf('โอน') !== -1) {
+      kpi.debtCollectedTransfer += pAmt;
+      rRow.debtTransfer += pAmt;
+    } else {
+      kpi.debtCollectedCash += pAmt;
+      rRow.debtCash += pAmt;
+    }
+  });
+
+  var filteredDispatches = [];
+  var driverRouteMap = {};
+  var vehicleRouteMap = {};
+
+  dispatches.forEach(function(dsp) {
+    var rKeyAll = normalizeRoute_(dsp.RouteID || dsp.RouteName, '');
+    if (dsp.DriverName) driverRouteMap[String(dsp.DriverName).trim()] = rKeyAll;
+    if (dsp.VehicleID) vehicleRouteMap[String(dsp.VehicleID).trim()] = rKeyAll;
+
+    if (!inDateRange_(dsp.DispatchDate)) return;
+    if (!matchRouteFilter_(rKeyAll)) return;
+
+    var startM = parseFloat(dsp.StartMileage) || 0;
+    var endM = parseFloat(dsp.EndMileage) || 0;
+    var dist = (startM > 0 && endM >= startM) ? (endM - startM) : 0;
+    var loss = parseFloat(dsp.LossQty) || 0;
+
+    dsp.DistanceKm = dist;
+    filteredDispatches.push(dsp);
+
+    var rRow = getRouteRow_(rKeyAll);
+    rRow.distanceKm += dist;
+    kpi.totalDistanceKm += dist;
+    kpi.totalLossQty += loss;
+  });
+
+  var filteredFuels = [];
+  fuelLogs.forEach(function(f) {
+    if (!inDateRange_(f.FuelDate)) return;
+    var fDrv = String(f.DriverName || '').trim();
+    var fVeh = String(f.VehicleID || '').trim();
+    var rKey = driverRouteMap[fDrv] || vehicleRouteMap[fVeh] || 'หน้าลาน';
+
+    if (!matchRouteFilter_(rKey)) return;
+
+    var fCost = parseFloat(f.TotalCost) || 0;
+    var isCashFuel = (String(f.PaidBy || '').indexOf('เงินสด') !== -1 || String(f.PaidBy || '').indexOf('หัก') !== -1);
+    var rRow = getRouteRow_(rKey);
+
+    f.RouteName = rRow.RouteName;
+    filteredFuels.push(f);
+
+    kpi.totalFuelCost += fCost;
+    rRow.fuelTotal += fCost;
+    if (isCashFuel) {
+      kpi.totalFuelCash += fCost;
+      rRow.fuelCash += fCost;
+    }
+  });
+
+  var filteredInvLogs = [];
+  var invStats = { totalProduced: 0, totalCrushedOut: 0, totalCrushedIn: 0, totalDispatched: 0, totalAdjusted: 0 };
+
+  invLogs.forEach(function(log) {
+    if (!inDateRange_(log.LogDate)) return;
+    var qIn = parseFloat(log.QtyIn) || 0;
+    var qOut = parseFloat(log.QtyOut) || 0;
+    var act = String(log.ActionType || '');
+
+    if (act === 'ผลิตเข้าคลัง') invStats.totalProduced += qIn;
+    else if (act.indexOf('เบิกไปบด') !== -1) invStats.totalCrushedOut += qOut;
+    else if (act.indexOf('รับเข้าจากบด') !== -1) invStats.totalCrushedIn += qIn;
+    else if (act.indexOf('เบิกขึ้นรถ') !== -1 || act.indexOf('เบิกเพิ่ม') !== -1 || act === 'ขายหน้าลาน') invStats.totalDispatched += qOut;
+    else invStats.totalAdjusted += (qIn - qOut);
+
+    filteredInvLogs.push(log);
+  });
+
+  var routeBreakdown = Object.keys(routeMatrix).map(function(k) {
+    var r = routeMatrix[k];
+    r.netCashToSafe = r.cashSales + r.debtCash - r.fuelCash;
+    return r;
+  }).filter(function(r) {
+    return filterRoute === 'ALL' ? true : (r.RouteKey === filterRoute);
+  });
+
+  kpi.netCashToSafe = kpi.cashSales + kpi.debtCollectedCash - kpi.totalFuelCash;
+  kpi.totalBankTransfer = kpi.transferSales + kpi.debtCollectedTransfer;
+  kpi.periodDays = periodDays;
+
+  return {
+    filters: { startDate: startDate, endDate: endDate, routeId: filterRoute },
+    routes: routes,
+    kpi: kpi,
+    routeBreakdown: routeBreakdown,
+    customerRankingList: customerRankingList,
+    salesList: filteredSales.reverse(),
+    cancelledList: cancelledSales.reverse(),
+    paymentsList: filteredPayments.reverse(),
+    dispatchesList: filteredDispatches.reverse(),
+    fuelsList: filteredFuels.reverse(),
+    invStats: invStats,
+    invLogsList: filteredInvLogs.reverse()
+  };
+}
+// ==========================================
+// 🔐 MODULE 12: FACTORY AUTHENTICATION & RBAC (ระบบล็อกอินสำนักงาน & แยกสิทธิ์)
+// ==========================================
+function api_verifyFactoryLogin(payload) {
+  var empHeaders = ['EmpID', 'EmpName', 'Phone', 'Position', 'PIN', 'Status', 'CreatedAt'];
+  var empSheet = getOrCreateSheet('tb_Employees', empHeaders);
+  
+  // หากตารางพนักงานยังว่างเปล่า ให้สร้างบัญชีผู้บริหารและเสมียนเริ่มต้นให้อัตโนมัติ
+  if (empSheet.getLastRow() <= 1) {
+    var now = new Date();
+    empSheet.getRange(2, 1, 3, 7).setValues([
+      ['EMP-0001', 'คุณธีระศักดิ์ (ผู้จัดการ)', '088-262-9154', 'ผู้บริหาร/ผู้จัดการ', '9999', 'Active', now],
+      ['EMP-0002', 'เสมียนหน้าลาน', '081-000-1234', 'เสมียนหน้าลาน', '1234', 'Active', now],
+      ['EMP-0003', 'สมชาย (สายส่ง)', '081-111-1111', 'คนขับรถ', '1111', 'Active', now]
+    ]);
+  }
+
+  var pin = payload && payload.pin ? String(payload.pin).trim() : '';
+  if (!pin) throw new Error('กรุณากรอกรหัส PIN เข้าสู่ระบบ');
+
+  var employees = getSheetDataAsObjects('tb_Employees', empHeaders).filter(function(e) {
+    return e.Status !== 'Inactive';
+  });
+
+  var matchedEmp = employees.find(function(e) {
+    var empPin = String(e.PIN || '').trim();
+    var phoneLast4 = String(e.Phone || '').replace(/\D/g, '').slice(-4);
+    return empPin === pin || (phoneLast4 !== '' && phoneLast4 === pin);
+  });
+
+  // กรณีฉุกเฉิน: หากยังไม่ได้เพิ่มผู้บริหารในชีต แต่กดรหัส Master 9999
+  if (!matchedEmp && pin === '9999') {
+    matchedEmp = {
+      EmpID: 'ADMIN-MASTER',
+      EmpName: 'ผู้บริหาร (Master Admin)',
+      Position: 'ผู้บริหาร',
+      PIN: '9999'
+    };
+  }
+
+  if (!matchedEmp) {
+    writeLog('FACTORY_LOGIN_FAIL', 'PIN: ' + pin, 'WARNING');
+    throw new Error('รหัส PIN ไม่ถูกต้อง หรือบัญชีถูกระงับการใช้งาน');
+  }
+
+  var pos = String(matchedEmp.Position || '').trim();
+  var role = 'CLERK'; // ค่าเริ่มต้น = เสมียนหน้าลาน
+  if (pos.indexOf('บริหาร') !== -1 || pos.indexOf('จัดการ') !== -1 || pos.indexOf('เจ้าของ') !== -1 || pos.toLowerCase().indexOf('admin') !== -1) {
+    role = 'ADMIN';
+  } else if (pos.indexOf('ขับ') !== -1 || pos.toLowerCase().indexOf('driver') !== -1) {
+    role = 'DRIVER';
+  }
+
+  if (role === 'DRIVER') {
+    throw new Error('รหัส PIN นี้เป็นของ "พนักงานขับรถสายส่ง" (' + matchedEmp.EmpName + ') กรุณาเข้าใช้งานผ่านลิงก์ระบบหน่วยรถสายส่ง (?page=driver) ค่ะ');
+  }
+
+  writeLog('FACTORY_LOGIN', matchedEmp.EmpName + ' (' + role + ')', 'SUCCESS');
+  return {
+    EmpID: matchedEmp.EmpID,
+    EmpName: matchedEmp.EmpName,
+    Position: pos || 'เจ้าหน้าที่สำนักงาน',
+    Role: role,
+    LoginTime: Utilities.formatDate(new Date(), 'GMT+7', 'HH:mm')
+  };
+}
+// ==========================================
+// 💰 MODULE 13: FACTORY CASHFLOW, PETTY CASH & EXPENSE MANAGEMENT (ระบบรายรับ-รายจ่าย & งบกำไรสุทธิ)
+// ==========================================
+function api_getExpenseDashboard(payload) {
+  var todayStr = Utilities.formatDate(new Date(), 'GMT+7', 'yyyy-MM-dd');
+  var startDate = (payload && payload.startDate) ? String(payload.startDate).trim() : todayStr;
+  var endDate = (payload && payload.endDate) ? String(payload.endDate).trim() : todayStr;
+
+  var expHeaders = ['ExpID', 'ExpDate', 'TxType', 'Category', 'Title', 'Amount', 'PayChannel', 'RefTarget', 'Status', 'CreatedBy', 'Note'];
+  getOrCreateSheet('tb_Expenses', expHeaders);
+
+  var expenses = getSheetDataAsObjects('tb_Expenses', expHeaders);
+  var sales = getSheetDataAsObjects('tb_Sales', ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy']);
+  var payments = getSheetDataAsObjects('tb_Payments', ['PaymentID', 'PaymentDate', 'CustomerID', 'CustomerName', 'RefSaleIDs', 'AmountPaid', 'PaymentMethod', 'CreatedBy', 'Note']);
+  var fuelLogs = getSheetDataAsObjects('tb_FuelLogs', ['FuelID', 'FuelDate', 'VehicleID', 'DriverName', 'Mileage', 'Liters', 'TotalCost', 'PaidBy', 'Note']);
+  var employees = getSheetDataAsObjects('tb_Employees', ['EmpID', 'EmpName', 'Phone', 'Position', 'PIN', 'Status', 'CreatedAt']).filter(function(e) { return e.Status !== 'Inactive'; });
+  var vehicles = getSheetDataAsObjects('tb_Vehicles', ['VehicleID', 'LicensePlate', 'VehicleType', 'Capacity', 'Status', 'CreatedAt']).filter(function(v) { return v.Status !== 'Inactive'; });
+
+  function inRange_(dateVal) {
+    var d = String(dateVal || '').slice(0, 10);
+    return d >= startDate && d <= endDate;
+  }
+
+  // 1. คำนวณรายรับจากการขายน้ำแข็ง (แยกหน้าลาน vs สายส่ง และ เงินสด vs โอน)
+  var iceCashFront = 0, iceCashRoute = 0, iceTransferTotal = 0, iceCreditNew = 0;
+  sales.forEach(function(s) {
+    if (!inRange_(s.SaleDate)) return;
+    if (s.PaymentStatus === 'Cancelled' || s.PaymentStatus === 'ยกเลิก') return;
+    if (String(s.SaleID || '').indexOf('AR-') === 0) return;
+
+    var amt = parseFloat(s.TotalAmount) || 0;
+    var pType = String(s.PaymentType || 'เงินสด');
+    var rId = String(s.RouteID || '').trim();
+    var isFront = (rId === '' || rId === 'หน้าลาน' || rId === 'หน้าร้าน' || rId === 'หน้าโรง' || rId === 'หน้าโรงงาน' || rId === 'WALK-IN');
+
+    if (pType.indexOf('เครดิต') !== -1 || pType.indexOf('บิลเชื่อ') !== -1 || pType.indexOf('ค้างชำระ') !== -1) {
+      iceCreditNew += amt;
+    } else if (pType.indexOf('โอน') !== -1) {
+      iceTransferTotal += amt;
+    } else {
+      if (isFront) iceCashFront += amt;
+      else iceCashRoute += amt;
+    }
+  });
+
+  // 2. คำนวณรายรับจากการเก็บหนี้ค้างเก่า (tb_Payments)
+  var debtCashFront = 0, debtCashRoute = 0, debtTransferTotal = 0;
+  payments.forEach(function(p) {
+    if (!inRange_(p.PaymentDate)) return;
+    var pAmt = parseFloat(p.AmountPaid) || 0;
+    var method = String(p.PaymentMethod || 'เงินสด');
+    var byDriver = String(p.CreatedBy || '').indexOf('คนขับ') !== -1;
+
+    if (method.indexOf('โอน') !== -1) {
+      debtTransferTotal += pAmt;
+    } else {
+      if (byDriver) debtCashRoute += pAmt;
+      else debtCashFront += pAmt;
+    }
+  });
+
+  // 3. คำนวณรายจ่ายค่าน้ำมันเชื้อเพลิงอัตโนมัติจาก tb_FuelLogs
+  var fuelCashRoute = 0, fuelCashFront = 0, fuelCreditStation = 0, fuelTotalCost = 0;
+  fuelLogs.forEach(function(f) {
+    if (!inRange_(f.FuelDate)) return;
+    var cost = parseFloat(f.TotalCost) || 0;
+    var paidBy = String(f.PaidBy || '');
+    fuelTotalCost += cost;
+    if (paidBy.indexOf('สายส่ง') !== -1 || paidBy.indexOf('หัก') !== -1) {
+      fuelCashRoute += cost;
+    } else if (paidBy.indexOf('หน้าลาน') !== -1 || paidBy.indexOf('เงินสด') !== -1) {
+      fuelCashFront += cost;
+    } else {
+      fuelCreditStation += cost;
+    }
+  });
+
+  // 4. ประมวลผลตาราง tb_Expenses (รายจ่ายโรงงาน & รายรับอื่นๆ)
+  var filteredExpenses = [];
+  var otherIncomeCashFront = 0, otherIncomeBank = 0, otherIncomeTotal = 0;
+  var expDrawerCash = 0, expSafeCash = 0, expBankTransfer = 0, expManualTotal = 0;
+
+  var categoryMap = {
+    '⛽ ค่าน้ำมันเชื้อเพลิง (ดึงอัตโนมัติ)': fuelTotalCost,
+    '⚡ ค่าไฟฟ้า (PEA)': 0,
+    '🛍️ ค่ากระสอบ / ถุง / เชือก': 0,
+    '👷 ค่าแรง / เงินเดือน / OT': 0,
+    '💸 พนักงานเบิกเงินล่วงหน้า': 0,
+    '🔧 ซ่อมบำรุงเครื่องจักร / ห้องเย็น': 0,
+    '🚚 ซ่อมบำรุงรถสายส่ง / ยาง / น้ำมันเครื่อง': 0,
+    '💧 ค่าน้ำดิบ / สารกรอง / เกลือ / คลอรีน': 0,
+    '🍱 ค่าอาหาร / น้ำดื่ม / สวัสดิการ': 0,
+    '🏢 ค่าใช้จ่ายบริหาร / เบ็ดเตล็ดหน้าลาน': 0
+  };
+
+  var empAdvanceMap = {}; // เก็บยอดเบิกเงินล่วงหน้าสะสมรายพนักงานในช่วงเวลาที่เลือก
+
+  expenses.forEach(function(ex) {
+    if (!inRange_(ex.ExpDate)) return;
+    var isCancelled = (ex.Status === 'Cancelled' || ex.Status === 'ยกเลิก');
+    filteredExpenses.push(ex);
+    if (isCancelled) return;
+
+    var amt = parseFloat(ex.Amount) || 0;
+    var txType = String(ex.TxType || 'EXPENSE');
+    var channel = String(ex.PayChannel || 'เงินสดหน้าลาน (ลิ้นชัก)');
+    var cat = String(ex.Category || '🏢 ค่าใช้จ่ายบริหาร / เบ็ดเตล็ดหน้าลาน');
+
+    if (txType === 'OTHER_INCOME') {
+      otherIncomeTotal += amt;
+      if (channel.indexOf('โอน') !== -1 || channel.indexOf('ธนาคาร') !== -1) otherIncomeBank += amt;
+      else otherIncomeCashFront += amt;
+    } else {
+      expManualTotal += amt;
+      if (channel.indexOf('ลิ้นชัก') !== -1 || channel.indexOf('หน้าลาน') !== -1) expDrawerCash += amt;
+      else if (channel.indexOf('โอน') !== -1 || channel.indexOf('ธนาคาร') !== -1) expBankTransfer += amt;
+      else expSafeCash += amt;
+
+      if (categoryMap[cat] === undefined) categoryMap[cat] = 0;
+      categoryMap[cat] += amt;
+
+      if (cat.indexOf('เบิกเงินล่วงหน้า') !== -1 && ex.RefTarget) {
+        var empName = String(ex.RefTarget).trim();
+        empAdvanceMap[empName] = (empAdvanceMap[empName] || 0) + amt;
+      }
+    }
+  });
+
+  // 5. สรุปตัวเลข Cashflow & Net Profit
+  var totalCashIn = iceCashFront + iceCashRoute + debtCashFront + debtCashRoute + otherIncomeCashFront;
+  var totalBankIn = iceTransferTotal + debtTransferTotal + otherIncomeBank;
+  var totalInflow = totalCashIn + totalBankIn;
+
+  var totalOutflow = fuelTotalCost + expManualTotal;
+  var netCashflow = totalInflow - totalOutflow;
+
+  // เงินสดคงเหลือในลิ้นชักหน้าลานสุทธิ (เฉพาะที่เสมียนรับและจ่ายที่โต๊ะหน้าลาน)
+  var frontDrawerNetCash = iceCashFront + debtCashFront + otherIncomeCashFront - fuelCashFront - expDrawerCash;
+  // เงินสดสุทธิจากสายส่ง
+  var routeNetCash = iceCashRoute + debtCashRoute - fuelCashRoute;
+
+  var categoryBreakdown = Object.keys(categoryMap).map(function(k) {
+    var val = categoryMap[k];
+    var pct = totalOutflow > 0 ? Number(((val / totalOutflow) * 100).toFixed(1)) : 0;
+    return { category: k, amount: val, percent: pct };
+  }).filter(function(item) { return item.amount > 0; }).sort(function(a, b) { return b.amount - a.amount; });
+
+  var advanceList = Object.keys(empAdvanceMap).map(function(emp) {
+    return { empName: emp, totalAdvance: empAdvanceMap[emp] };
+  }).sort(function(a, b) { return b.totalAdvance - a.totalAdvance; });
+
+  return {
+    filters: { startDate: startDate, endDate: endDate },
+    summary: {
+      iceCashFront: iceCashFront,
+      iceCashRoute: iceCashRoute,
+      iceTransferTotal: iceTransferTotal,
+      iceCreditNew: iceCreditNew,
+      debtCashFront: debtCashFront,
+      debtCashRoute: debtCashRoute,
+      debtTransferTotal: debtTransferTotal,
+      otherIncomeTotal: otherIncomeTotal,
+      totalInflow: totalInflow,
+      fuelTotalCost: fuelTotalCost,
+      fuelCashRoute: fuelCashRoute,
+      fuelCashFront: fuelCashFront,
+      expManualTotal: expManualTotal,
+      expDrawerCash: expDrawerCash,
+      expSafeCash: expSafeCash,
+      expBankTransfer: expBankTransfer,
+      totalOutflow: totalOutflow,
+      netCashflow: netCashflow,
+      frontDrawerNetCash: frontDrawerNetCash,
+      routeNetCash: routeNetCash
+    },
+    categoryBreakdown: categoryBreakdown,
+    advanceList: advanceList,
+    expensesList: filteredExpenses.reverse(),
+    employees: employees,
+    vehicles: vehicles
+  };
+}
+
+function api_saveExpense(payload) {
+  return withSheetLock_(function() {
+    var title = payload && payload.Title ? String(payload.Title).trim() : '';
+    var amount = parseFloat(payload.Amount) || 0;
+    if (!title) throw new Error('กรุณาระบุรายละเอียดรายการ (เช่น จ่ายค่าปะยาง, ค่าไฟเดือน ต.ค.)');
+    if (amount <= 0) throw new Error('กรุณาระบุจำนวนเงินให้มากกว่า 0 บาท');
+
+    var expHeaders = ['ExpID', 'ExpDate', 'TxType', 'Category', 'Title', 'Amount', 'PayChannel', 'RefTarget', 'Status', 'CreatedBy', 'Note'];
+    var sheet = getOrCreateSheet('tb_Expenses', expHeaders);
+
+    var now = new Date();
+    var txDateObj = now;
+    if (payload.ExpDate) {
+      var timeSuffix = Utilities.formatDate(now, 'GMT+7', 'HH:mm:ss');
+      var parsed = new Date(payload.ExpDate + 'T' + timeSuffix);
+      if (!isNaN(parsed.getTime())) txDateObj = parsed;
+    }
+
+    var datePrefix = Utilities.formatDate(txDateObj, 'GMT+7', 'yyyyMMdd');
+    var expId = generateId(sheet, 'EXP-' + datePrefix, 4);
+
+    sheet.appendRow([
+      expId,
+      txDateObj,
+      payload.TxType || 'EXPENSE',
+      payload.Category || '🏢 ค่าใช้จ่ายบริหาร / เบ็ดเตล็ดหน้าลาน',
+      title,
+      amount,
+      payload.PayChannel || 'เงินสดหน้าลาน (ลิ้นชัก)',
+      payload.RefTarget || '',
+      'Active',
+      payload.CreatedBy || 'Admin',
+      payload.Note || ''
+    ]);
+
+    SpreadsheetApp.flush();
+    writeLog('SAVE_EXPENSE', expId + ' | ' + payload.Category + ' | ' + title + ' (฿' + amount + ')', 'SUCCESS');
+    return { ExpID: expId };
+  });
+}
+
+function api_cancelExpense(payload) {
+  return withSheetLock_(function() {
+    var expId = payload && payload.ExpID ? String(payload.ExpID).trim() : '';
+    if (!expId) throw new Error('ไม่พบรหัสรายการที่ต้องการยกเลิก');
+
+    var expHeaders = ['ExpID', 'ExpDate', 'TxType', 'Category', 'Title', 'Amount', 'PayChannel', 'RefTarget', 'Status', 'CreatedBy', 'Note'];
+    var sheet = getOrCreateSheet('tb_Expenses', expHeaders);
+    var data = sheet.getDataRange().getValues();
+
+    for (var i = 1; i < data.length; i++) {
+      if (String(data[i][0]).trim() === expId) {
+        sheet.getRange(i + 1, 9).setValue('Cancelled');
+        SpreadsheetApp.flush();
+        writeLog('CANCEL_EXPENSE', expId + ' (' + data[i][4] + ' ฿' + data[i][5] + ') โดย ' + (payload.CreatedBy || 'Admin'), 'WARNING');
+        return { ExpID: expId, Status: 'Cancelled' };
+      }
+    }
+    throw new Error('ไม่พบรหัสรายการ: ' + expId);
+  });
+}
