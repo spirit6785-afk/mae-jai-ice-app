@@ -1563,8 +1563,24 @@ function api_saveFuelLog(payload) {
   });
 }
 // ==========================================
-// 💳 MODULE 7: CREDIT & AR COLLECTION (ฉบับสมบูรณ์: แยกหนี้ขาจร + รับชำระหนี้ + ตั้งหนี้ยกมา)
+// 💳 MODULE 7: CREDIT & AR COLLECTION (ซ่อม api_addManualCreditBill + รวมการ์ดขาจรชื่อซ้ำ)
 // ==========================================
+
+/**
+ * 🧹 ตัวช่วยจัดมาตรฐานชื่อลูกค้าขาจร เพื่อไม่ให้งานเดียวกัน (เช่น "งานศพป่าตึง") แยกเป็น 2 การ์ด
+ */
+function normalizeWalkInName_(rawName) {
+  var s = String(rawName || '').replace(/🚶/g, '').trim();
+  // ตัดคำว่า "ขาจร:" หรือ "ขาจร" ด้านหน้าออกก่อนเพื่อจัดรูปแบบให้เหมือนกันทั้งหมด
+  s = s.replace(/^(ขาจร\s*:\s*|ขาจร\s+)/i, '').trim();
+  // ยุบช่องว่างหลายเคาะให้เหลือเคาะเดียว
+  s = s.replace(/\s+/g, ' ');
+  if (!s || s === 'ลูกค้าขาจรทั่วไป' || s === 'ลูกค้าขาจร') {
+    return 'ลูกค้าขาจรทั่วไป';
+  }
+  return 'ขาจร: ' + s;
+}
+
 function api_getCreditDashboard() {
   var sales = getSheetDataAsObjects('tb_Sales', ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy']);
   var saleDetails = getSheetDataAsObjects('tb_SalesDetails', ['DetailID', 'SaleID', 'ProductID', 'ProductName', 'Quantity', 'UnitPrice', 'SubTotal']);
@@ -1576,15 +1592,20 @@ function api_getCreditDashboard() {
   routes.forEach(function(r) { routeMap[r.RouteID] = r.RouteName; });
 
   var custMap = {};
+  var nameToCustId = {};
   customers.forEach(function(c) {
-    custMap[c.CustomerID] = {
-      CustomerID: c.CustomerID,
+    var cid = String(c.CustomerID).trim();
+    custMap[cid] = {
+      CustomerID: cid,
       CustomerName: c.CustomerName,
       Phone: c.Phone || '',
       RouteID: c.RouteID || 'หน้าลาน',
       RouteName: routeMap[c.RouteID] || c.RouteID || 'หน้าลาน',
       CreditLimit: parseFloat(c.CreditLimit) || 0
     };
+    if (c.CustomerName) {
+      nameToCustId[String(c.CustomerName).trim().toLowerCase()] = cid;
+    }
   });
 
   var itemSummaryBySale = {};
@@ -1606,12 +1627,19 @@ function api_getCreditDashboard() {
     if (isCredit && isUnpaid) {
       var rawCid = String(s.CustomerID || 'WALK-IN').trim();
       var rawCName = String(s.CustomerName || 'ลูกค้าขาจรทั่วไป').trim();
-      var isWalkIn = (rawCid === 'WALK-IN' || rawCid === '');
-      var debtKey = isWalkIn ? ('WALK-IN::' + rawCName) : rawCid;
+
+      // หากไม่ได้ระบุรหัสลูกค้า แต่ชื่อตรงกับร้านประจำในทะเบียน ให้ผูกเข้าร้านประจำทันที
+      if ((rawCid === 'WALK-IN' || !custMap[rawCid]) && nameToCustId[rawCName.toLowerCase()]) {
+        rawCid = nameToCustId[rawCName.toLowerCase()];
+      }
+
+      var isWalkIn = (rawCid === 'WALK-IN' || rawCid === '' || !custMap[rawCid]);
+      var stdWalkInName = isWalkIn ? normalizeWalkInName_(rawCName) : rawCName;
+      var debtKey = isWalkIn ? ('WALK-IN::' + stdWalkInName) : rawCid;
 
       var cInfo = (!isWalkIn && custMap[rawCid]) ? custMap[rawCid] : {
         CustomerID: debtKey,
-        CustomerName: isWalkIn ? ('🚶 ' + rawCName) : rawCName,
+        CustomerName: '🚶 ' + stdWalkInName,
         Phone: '',
         RouteID: s.RouteID || 'หน้าลาน',
         RouteName: routeMap[s.RouteID] || s.RouteID || 'หน้าลาน',
@@ -1661,7 +1689,7 @@ function api_getCreditDashboard() {
 }
 
 /**
- * 💰 บันทึกรับชำระหนี้ค้าง (ใช้ทั้งฝั่งมือถือคนขับ และ หน้าลูกหนี้สำนักงาน)
+ * 💰 บันทึกรับชำระหนี้ค้าง (รองรับทั้งฝั่งมือถือคนขับ และ หน้าลูกหนี้สำนักงาน)
  */
 function api_savePayment(payload) {
   return withSheetLock_(function() {
@@ -1671,7 +1699,6 @@ function api_savePayment(payload) {
     }
 
     var createdBy = String(payload.CreatedBy || 'Admin');
-    // 🛡️ หากเป็นการกดรับเงินจากมือถือคนขับ ต้องเช็กว่ากะสายส่งยังเปิดอยู่หรือไม่
     if (createdBy.indexOf('คนขับ:') === 0 && typeof assertRouteShiftActive_ === 'function') {
       var drvName = createdBy.replace('คนขับ:', '').trim();
       assertRouteShiftActive_('', drvName);
@@ -1700,10 +1727,9 @@ function api_savePayment(payload) {
     var payId = generateId(paySheet, 'PAY-' + datePrefix, 4);
     var amountPaid = parseFloat(payload.AmountPaid) || 0;
 
-    // แปลงรหัส WALK-IN::ชื่อขาจร ให้เก็บเป็นรหัสมาตรฐาน WALK-IN ในตาราง tb_Payments
     var rawCid = String(payload.CustomerID || 'WALK-IN').trim();
     var cleanCid = rawCid.indexOf('WALK-IN::') === 0 ? 'WALK-IN' : rawCid;
-    var cleanCName = String(payload.CustomerName || '').replace(/^🚶\s*/, '').trim() || 'ลูกค้า';
+    var cleanCName = String(payload.CustomerName || '').replace(/🚶/g, '').trim() || 'ลูกค้า';
 
     paySheet.appendRow([
       payId,
@@ -1724,14 +1750,49 @@ function api_savePayment(payload) {
 }
 
 /**
- * 📝 บันทึกตั้งหนี้ยกมา / เพิ่มลูกหนี้เก่าเข้าระบบ (Manual AR Entry)
+ * 📝 บันทึกเพิ่มรายการลูกหนี้ / ยอดหนี้ยกมา (รองรับคำสั่ง api_addManualCreditBill จาก Modals.html)
  */
-function api_saveManualDebt(payload) {
+function api_addManualCreditBill(payload) {
   return withSheetLock_(function() {
-    var cid = payload && payload.CustomerID ? String(payload.CustomerID).trim() : '';
-    var cname = payload && payload.CustomerName ? String(payload.CustomerName).trim() : '';
+    var rawInput = payload && (payload.CustomerInput || payload.CustomerName || payload.CustomerID) ? String(payload.CustomerInput || payload.CustomerName || payload.CustomerID).trim() : '';
     var amt = parseFloat(payload.Amount) || 0;
-    if (!cid || amt <= 0) throw new Error('กรุณาเลือกลูกค้าและระบุยอดหนี้ค้างให้ถูกต้อง');
+    if (!rawInput) throw new Error('กรุณาเลือกร้านค้า หรือ พิมพ์ชื่อร้านลูกหนี้');
+    if (amt <= 0) throw new Error('กรุณาระบุจำนวนเงินค้างชำระให้มากกว่า 0 บาท');
+
+    var routeId = payload.RouteID ? String(payload.RouteID).trim() : 'หน้าลาน';
+    var custId = '';
+    var custName = '';
+
+    // แยกกรณีเลือกร้านค้าจาก Datalist เช่น "C028 : ครัวหนองเลิงทราย"
+    if (rawInput.indexOf(' : ') !== -1) {
+      var parts = rawInput.split(' : ');
+      custId = parts[0].trim();
+      custName = parts.slice(1).join(' : ').trim();
+    } else {
+      // ค้นหาจากทะเบียนลูกค้าว่ามีชื่อหรือรหัสนี้หรือไม่
+      var allCusts = api_getCustomers();
+      var found = allCusts.find(function(c) {
+        return String(c.CustomerID).trim().toLowerCase() === rawInput.toLowerCase() ||
+               String(c.CustomerName).trim().toLowerCase() === rawInput.toLowerCase();
+      });
+
+      if (found) {
+        custId = found.CustomerID;
+        custName = found.CustomerName;
+        if (!payload.RouteID && found.RouteID) routeId = found.RouteID;
+      } else if (/^ขาจร/i.test(rawInput)) {
+        // กรณีตั้งหนี้ให้ลูกค้าขาจร
+        custId = 'WALK-IN';
+        custName = normalizeWalkInName_(rawInput);
+      } else {
+        // กรณีพิมพ์ชื่อร้านใหม่ที่ไม่เคยมีในทะเบียนลูกค้า -> สร้างรหัสลูกค้าใหม่ให้อัตโนมัติ
+        var custHeaders = ['CustomerID', 'CustomerName', 'Phone', 'CustomerType', 'RouteID', 'CreditLimit', 'Status', 'CreatedAt'];
+        var custSheet = getOrCreateSheet('tb_Customers', custHeaders);
+        custId = generateId(custSheet, 'C', 4);
+        custName = rawInput;
+        custSheet.appendRow([custId, custName, '', 'ร้านประจำ', routeId, 0, 'Active', new Date()]);
+      }
+    }
 
     var salesHeaders = ['SaleID', 'SaleDate', 'CustomerID', 'CustomerName', 'RouteID', 'TotalAmount', 'PaymentType', 'PaymentStatus', 'CreatedBy'];
     var detailHeaders = ['DetailID', 'SaleID', 'ProductID', 'ProductName', 'Quantity', 'UnitPrice', 'SubTotal'];
@@ -1739,18 +1800,20 @@ function api_saveManualDebt(payload) {
     var detailSheet = getOrCreateSheet('tb_SalesDetails', detailHeaders);
 
     var now = new Date();
-    var billDate = payload.BillDate ? new Date(payload.BillDate + 'T08:00:00') : now;
+    var dateStr = payload.SaleDate || payload.BillDate || '';
+    var billDate = dateStr ? new Date(dateStr + 'T08:00:00') : now;
     if (isNaN(billDate.getTime())) billDate = now;
 
     var datePrefix = Utilities.formatDate(billDate, 'GMT+7', 'yyyyMMdd');
     var saleId = generateId(salesSheet, 'AR-' + datePrefix, 4);
+    var summaryText = String(payload.ItemSummary || payload.Note || 'ยอดหนี้คงค้างยกมา').trim();
 
     salesSheet.appendRow([
       saleId,
       billDate,
-      cid,
-      cname,
-      payload.RouteID || 'หน้าลาน',
+      custId,
+      custName,
+      routeId,
       amt,
       'เครดิต (ยอดยกมา)',
       'Unpaid',
@@ -1761,16 +1824,21 @@ function api_saveManualDebt(payload) {
       saleId + '-1',
       saleId,
       'AR-MANUAL',
-      payload.Note ? ('ยอดหนี้คงค้างยกมา: ' + payload.Note) : 'ยอดหนี้คงค้างยกมา',
+      summaryText,
       1,
       amt,
       amt
     ]);
 
     SpreadsheetApp.flush();
-    writeLog('MANUAL_DEBT', saleId + ' ตั้งหนี้ยกมา ' + cname + ' ฿' + amt, 'INFO');
-    return { SaleID: saleId };
+    writeLog('MANUAL_DEBT', saleId + ' ตั้งหนี้ยกมา ' + custName + ' (' + custId + ') ฿' + amt, 'SUCCESS');
+    return { SaleID: saleId, CustomerID: custId, CustomerName: custName };
   });
+}
+
+// เชื่อมชื่อฟังก์ชันสำรองไว้ทั้ง 2 ชื่อเพื่อความปลอดภัย 100%
+function api_saveManualDebt(payload) {
+  return api_addManualCreditBill(payload);
 }
 // ==========================================
 // 📦 MODULE 8: INVENTORY MANAGEMENT
